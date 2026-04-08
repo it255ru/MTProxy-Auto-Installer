@@ -61,7 +61,7 @@ ssh -p ТЕКУЩИЙ_ПОРТ root@ВАШ_IP
 ## Установка
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/it265ru/MTProxy-Auto-Installer/main/server_harden.sh -o server_harden.sh
+curl -fsSL https://raw.githubusercontent.com/it255ru/MTProxy-Auto-Installer/refs/heads/main/server_harden.sh -o server_harden.sh
 bash server_harden.sh [новый_ssh_порт]
 ```
 
