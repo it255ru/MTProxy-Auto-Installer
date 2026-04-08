@@ -67,7 +67,7 @@ curl -fsSL https://raw.githubusercontent.com/it265ru/MTProxy-Auto-Installer/main
 Или скачать и запустить вручную:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/it265ru/MTProxy-Auto-Installer/main/mtproxy_install.sh -o mtproxy_install.sh
+curl -fsSL https://raw.githubusercontent.com/it255ru/MTProxy-Auto-Installer/refs/heads/main/mtproxy_install.sh -o mtproxy_install.sh
 bash mtproxy_install.sh [port] [mask_domain] [email]
 ```
 
