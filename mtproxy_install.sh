@@ -199,29 +199,30 @@ else
     # Asset selection with priority scoring.
     # telemt naming: telemt-x86_64-linux-gnu.tar.gz
     # Priority: gnu libc > musl static > plain binary; skip v3 (needs AVX-512) and .sha256
-    DOWNLOAD_URL=$(echo "$RELEASE_JSON" | python3 - "$TELEMT_ARCH" << 'PYEOF'
+    # Asset selection with priority scoring.
+    # FIX: "echo $JSON | python3 - << HEREDOC" — heredoc replaces stdin,
+    # pipe data is lost, json.load(sys.stdin) gets EOF → "parse error".
+    # Fix: write selector to temp file, pipe JSON to it as normal stdin.
+    ASSET_SELECTOR="/tmp/telemt_sel_$$.py"
+    cat > "$ASSET_SELECTOR" << 'SELEOF'
 import sys, json
-
 arch = sys.argv[1]
-
 def score(name):
     n = name.lower()
-    if n.endswith('.sha256'):          return 99  # skip checksums
-    if arch not in n:                  return 98  # wrong arch
-    if 'linux' not in n:               return 97  # wrong OS
-    if 'v3' in n:                      return 50  # AVX-512 variant — skip unless only option
+    if n.endswith('.sha256'): return 99
+    if arch not in n:         return 98
+    if 'linux' not in n:      return 97
+    if 'v3' in n:             return 50
     if n.endswith('.tar.gz'):
-        if 'gnu' in n:                 return 1   # best: standard glibc
-        if 'musl' in n:                return 2   # ok: static musl
+        if 'gnu' in n:        return 1
+        if 'musl' in n:       return 2
         return 3
-    if n == 'telemt':                  return 10  # plain binary fallback
+    if n == 'telemt':         return 10
     return 5
-
 try:
     data = json.load(sys.stdin)
-    assets = data.get('assets', [])
     ranked = sorted([(score(a['name']), a['name'], a['browser_download_url'])
-                     for a in assets], key=lambda x: x[0])
+                     for a in data.get('assets', [])], key=lambda x: x[0])
     for s, name, url in ranked:
         if s < 90:
             sys.stderr.write(f"  Selected: {name} (score={s})\n")
@@ -230,8 +231,9 @@ try:
     sys.stderr.write("No suitable asset found\n")
 except Exception as e:
     sys.stderr.write(f"Asset parse error: {e}\n")
-PYEOF
-)
+SELEOF
+    DOWNLOAD_URL=$(echo "$RELEASE_JSON" | python3 "$ASSET_SELECTOR" "$TELEMT_ARCH")
+    rm -f "$ASSET_SELECTOR"
 
     if [ -z "$DOWNLOAD_URL" ]; then
         echo -e "${RED}  Cannot find telemt binary for $TELEMT_ARCH${NC}"
@@ -429,7 +431,7 @@ SERVICE
 systemctl daemon-reload
 systemctl enable telemt 2>/dev/null
 systemctl restart telemt
-sleep 4
+sleep 10
 
 if systemctl is-active --quiet telemt; then
     echo -e "  ${GREEN}✓ telemt service running${NC}"
@@ -744,30 +746,30 @@ ss -tlnp | grep ":${PORT} " \
 echo ""
 
 echo "  [9c] Connection links (from API):"
-sleep 3
+sleep 5
 # FIX: pipe API response via stdin to python — avoids shell string interpolation
 # and triple-quote injection risk with json.loads("""$VAR""")
 API_RESULT=$(curl -s --max-time 5 http://127.0.0.1:9091/v1/users 2>/dev/null)
 if [ -n "$API_RESULT" ]; then
     echo -e "    ${GREEN}✓ API responding${NC}"
-    echo "$API_RESULT" | python3 - << 'PYEOF'
+    echo "$API_RESULT" | python3 -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
     if isinstance(data, list):
         for u in data:
-            print(f"    User: {u.get('name','?')}")
-            print(f"    Link: {u.get('link', u.get('url','?'))}")
+            print(f\"    User: {u.get('name','?')}\")
+            print(f\"    Link: {u.get('link', u.get('url','?'))}\")
             print()
     elif isinstance(data, dict):
         for name, info in data.items():
             link = info.get('link', info.get('url', '?')) if isinstance(info, dict) else str(info)
-            print(f"    User: {name}")
-            print(f"    Link: {link}")
+            print(f\"    User: {name}\")
+            print(f\"    Link: {link}\")
             print()
 except Exception as e:
-    print(f"    (parse error: {e} — run: curl -s http://127.0.0.1:9091/v1/users | jq)")
-PYEOF
+    print(f\"    (parse error — run: curl -s http://127.0.0.1:9091/v1/users | jq)\")
+"
 else
     echo -e "    ${YELLOW}⚠ API not ready yet — run:${NC}"
     echo "    curl -s http://127.0.0.1:9091/v1/users | jq"
@@ -815,20 +817,20 @@ echo "  Without key → real TLS to $MASK_DOMAIN (real cert, real fingerprint)"
 echo "  DPI scanner → sees $MASK_DOMAIN, JA3/JA4 = real browser"
 echo ""
 echo -e "${CYAN} Connection links:${NC}"
-curl -s --max-time 5 http://127.0.0.1:9091/v1/users 2>/dev/null | python3 - << 'PYEOF'
+curl -s --max-time 5 http://127.0.0.1:9091/v1/users 2>/dev/null | python3 -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
     if isinstance(data, list):
         for u in data:
-            print(f"  {u.get('name','user')}: {u.get('link', u.get('url','?'))}")
+            print(f\"  {u.get('name','user')}: {u.get('link', u.get('url','?'))}\")
     elif isinstance(data, dict):
         for name, info in data.items():
             link = info.get('link', info.get('url','?')) if isinstance(info,dict) else '?'
-            print(f"  {name}: {link}")
+            print(f\"  {name}: {link}\")
 except:
-    print("  curl -s http://127.0.0.1:9091/v1/users | jq")
-PYEOF
+    print('  curl -s http://127.0.0.1:9091/v1/users | jq')
+"
 echo ""
 echo -e "${CYAN} Telegram manual setup:${NC}"
 echo "  Settings → Privacy → Use Proxy → Add Proxy → MTProto"
