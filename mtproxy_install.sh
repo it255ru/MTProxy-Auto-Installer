@@ -168,14 +168,15 @@ echo ""
 # ============================================================
 echo -e "${BLUE}[5/9] Installing telemt...${NC}"
 
-# Map arch to telemt release naming
+# Map arch to telemt release naming convention (x86_64 / aarch64)
+# telemt assets: telemt-x86_64-linux-gnu.tar.gz, telemt-aarch64-linux-gnu.tar.gz, etc.
 case "$ARCH" in
-    amd64|x86_64)   TELEMT_ARCH="amd64" ;;
-    arm64|aarch64)  TELEMT_ARCH="arm64" ;;
+    amd64|x86_64)   TELEMT_ARCH="x86_64" ;;
+    arm64|aarch64)  TELEMT_ARCH="aarch64" ;;
     armv7l|armhf)   TELEMT_ARCH="armv7" ;;
     *)
-        echo -e "${YELLOW}  Unknown arch $ARCH — trying amd64${NC}"
-        TELEMT_ARCH="amd64"
+        echo -e "${YELLOW}  Unknown arch $ARCH — trying x86_64${NC}"
+        TELEMT_ARCH="x86_64"
         ;;
 esac
 
@@ -191,26 +192,42 @@ if [ -z "$TELEMT_VERSION" ]; then
 fi
 echo "  Latest version: $TELEMT_VERSION"
 
-# Find the right asset URL
+# Find the right asset URL.
+# telemt naming: telemt-x86_64-linux-gnu.tar.gz  (prefer gnu over musl, skip v3 variants)
+# Priority: arch-linux-gnu > arch-linux-musl > plain binary named "telemt"
 DOWNLOAD_URL=$(echo "$RELEASE_JSON" | python3 - "$TELEMT_ARCH" << 'EOF'
 import sys, json
 arch = sys.argv[1]
 try:
     data = json.load(sys.stdin)
     assets = data.get('assets', [])
-    for a in assets:
-        name = a.get('name', '').lower()
-        if arch in name and 'linux' in name and name.endswith(('.tar.gz', '.gz', '')):
+
+    def score(name):
+        # Lower = higher priority
+        if name.endswith('.sha256'):        return 99   # skip checksums
+        if arch not in name:               return 98   # wrong arch
+        if 'linux' not in name:            return 97   # wrong OS
+        if 'v3' in name:                   return 10   # x86_64-v3 = needs AVX512, skip
+        if name.endswith('.tar.gz'):
+            if 'gnu' in name:              return 1    # best: gnu libc
+            if 'musl' in name:             return 2    # ok: static musl
+            return 3
+        return 5  # plain binary
+
+    candidates = [(score(a['name']), a) for a in assets]
+    candidates.sort(key=lambda x: x[0])
+    for s, a in candidates:
+        if s < 90:
             print(a['browser_download_url'])
             break
-    # fallback — any linux binary
+
+    # Last resort: asset literally named "telemt" (bare binary)
     for a in assets:
-        name = a.get('name', '').lower()
-        if 'linux' in name and arch in name:
+        if a['name'] == 'telemt':
             print(a['browser_download_url'])
             break
 except Exception as e:
-    pass
+    sys.stderr.write(f"Asset parse error: {e}\n")
 EOF
 )
 
