@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# MTProxy Auto-Installer v3.0 — telemt (TCP Splice)
+# MTProxy Auto-Installer v3.1 — telemt (TCP Splice)
 # Uses telemt instead of official Telegram Docker image.
 #
 # WHY telemt:
@@ -31,12 +31,9 @@ PORT="${1:-443}"
 MASK_DOMAIN="${2:-www.bing.com}"
 NOTIFY_EMAIL="${3:-${MTPROXY_EMAIL:-}}"
 
-# Latency thresholds (ms) from Russia — based on observed 40→600→block pattern
 LATENCY_WARN_MS=150
 LATENCY_CRIT_MS=400
 
-# Good mask domains — must be reachable from VPS on 443, real TLS.
-# Ideally: high-traffic sites that ISPs never block.
 GOOD_MASK_DOMAINS=(
     "www.bing.com"
     "www.microsoft.com"
@@ -61,7 +58,7 @@ fi
 
 echo ""
 echo "============================================================"
-echo " MTProxy Auto-Installer v3.0 — telemt TCP Splice"
+echo " MTProxy Auto-Installer v3.1 — telemt TCP Splice"
 echo "============================================================"
 echo " Port        : $PORT"
 echo " Mask Domain : $MASK_DOMAIN"
@@ -77,9 +74,12 @@ echo -e "${BLUE}[1/9] Detecting OS...${NC}"
 if [ -f /etc/os-release ]; then
     . /etc/os-release
     OS=$ID
-    ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m)
-    echo "  OS  : $PRETTY_NAME"
-    echo "  Arch: $ARCH"
+    # dpkg returns "amd64" — we need uname for the raw kernel arch
+    ARCH_DEB=$(dpkg --print-architecture 2>/dev/null || echo "")
+    ARCH_UNAME=$(uname -m)
+    echo "  OS       : $PRETTY_NAME"
+    echo "  Arch(deb): ${ARCH_DEB:-n/a}"
+    echo "  Arch(asm): $ARCH_UNAME"
 else
     echo -e "${RED}Cannot detect OS${NC}"; exit 1
 fi
@@ -120,11 +120,10 @@ EOF
 echo ""
 
 # ============================================================
-# STEP 3: CHECK PORT & MASK DOMAIN
+# STEP 3: PRE-FLIGHT CHECKS
 # ============================================================
 echo -e "${BLUE}[3/9] Pre-flight checks...${NC}"
 
-# Port check
 PORT_IN_USE=$(ss -tlnp 2>/dev/null | grep ":${PORT} " | grep -oP 'users:\(\("\K[^"]+' | head -1)
 if [ -n "$PORT_IN_USE" ] && [ "$PORT_IN_USE" != "telemt" ]; then
     echo -e "  ${YELLOW}⚠ Port ${PORT} used by: ${PORT_IN_USE}${NC}"
@@ -140,14 +139,12 @@ else
     echo -e "  ${GREEN}✓ Port ${PORT} is free${NC}"
 fi
 
-# Validate mask domain
 echo "  Checking mask domain reachability: $MASK_DOMAIN"
 if curl -s --max-time 8 -o /dev/null -w "%{http_code}" \
         "https://${MASK_DOMAIN}/" 2>/dev/null | grep -q "^[23]"; then
     echo -e "  ${GREEN}✓ $MASK_DOMAIN is reachable (TLS works)${NC}"
 else
-    echo -e "  ${YELLOW}⚠ $MASK_DOMAIN may be slow or unreachable from this VPS${NC}"
-    echo "    telemt will still work — mask domain only needs to be reachable"
+    echo -e "  ${YELLOW}⚠ $MASK_DOMAIN unreachable from this VPS — telemt will still work${NC}"
     echo "    Alternative: bash $0 $PORT www.microsoft.com"
 fi
 echo ""
@@ -159,7 +156,7 @@ echo -e "${BLUE}[4/9] Installing dependencies...${NC}"
 apt-get update -qq 2>/dev/null
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
     curl wget ca-certificates gnupg lsb-release \
-    ufw python3 openssl jq mailutils tar 2>/dev/null
+    ufw python3 openssl jq mailutils tar file 2>/dev/null
 echo -e "  ${GREEN}✓ Done${NC}"
 echo ""
 
@@ -168,112 +165,125 @@ echo ""
 # ============================================================
 echo -e "${BLUE}[5/9] Installing telemt...${NC}"
 
-# Map arch to telemt release naming convention (x86_64 / aarch64)
-# telemt assets: telemt-x86_64-linux-gnu.tar.gz, telemt-aarch64-linux-gnu.tar.gz, etc.
-case "$ARCH" in
-    amd64|x86_64)   TELEMT_ARCH="x86_64" ;;
-    arm64|aarch64)  TELEMT_ARCH="aarch64" ;;
-    armv7l|armhf)   TELEMT_ARCH="armv7" ;;
+# FIX: telemt uses x86_64/aarch64 naming, NOT amd64/arm64
+# dpkg reports "amd64" but telemt assets are named "x86_64"
+# We must use uname -m (kernel arch) to match telemt's naming convention.
+case "$ARCH_UNAME" in
+    x86_64)          TELEMT_ARCH="x86_64"  ;;
+    aarch64|arm64)   TELEMT_ARCH="aarch64" ;;
+    armv7l)          TELEMT_ARCH="armv7"   ;;
+    i386|i686)       TELEMT_ARCH="i686"    ;;
     *)
-        echo -e "${YELLOW}  Unknown arch $ARCH — trying x86_64${NC}"
+        echo -e "${YELLOW}  Unknown arch $ARCH_UNAME — trying x86_64${NC}"
         TELEMT_ARCH="x86_64"
         ;;
 esac
+echo "  Architecture: $ARCH_UNAME → telemt asset prefix: $TELEMT_ARCH"
 
-echo "  Fetching latest telemt release info..."
-RELEASE_JSON=$(curl -s --max-time 15 "$TELEMT_RELEASE_URL" 2>/dev/null)
-TELEMT_VERSION=$(echo "$RELEASE_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tag_name',''))" 2>/dev/null)
+# Skip download if already installed and working
+if [ -x "$TELEMT_BIN" ] && "$TELEMT_BIN" --version &>/dev/null; then
+    CURRENT_VER=$("$TELEMT_BIN" --version 2>/dev/null | head -1)
+    echo -e "  ${GREEN}✓ telemt already installed: $CURRENT_VER${NC}"
+else
+    echo "  Fetching latest release info..."
+    RELEASE_JSON=$(curl -s --max-time 15 "$TELEMT_RELEASE_URL" 2>/dev/null)
+    TELEMT_VERSION=$(echo "$RELEASE_JSON" | python3 -c \
+        "import sys,json; d=json.load(sys.stdin); print(d.get('tag_name',''))" 2>/dev/null)
 
-if [ -z "$TELEMT_VERSION" ]; then
-    echo -e "${RED}  Cannot fetch telemt release info from GitHub${NC}"
-    echo "  Check: https://github.com/telemt/telemt/releases"
-    echo "  Manual install: download binary, place at /usr/local/bin/telemt, chmod +x"
-    exit 1
-fi
-echo "  Latest version: $TELEMT_VERSION"
+    if [ -z "$TELEMT_VERSION" ]; then
+        echo -e "${RED}  Cannot fetch release info from GitHub${NC}"
+        exit 1
+    fi
+    echo "  Latest version: $TELEMT_VERSION"
 
-# Find the right asset URL.
-# telemt naming: telemt-x86_64-linux-gnu.tar.gz  (prefer gnu over musl, skip v3 variants)
-# Priority: arch-linux-gnu > arch-linux-musl > plain binary named "telemt"
-DOWNLOAD_URL=$(echo "$RELEASE_JSON" | python3 - "$TELEMT_ARCH" << 'EOF'
+    # Asset selection with priority scoring.
+    # telemt naming: telemt-x86_64-linux-gnu.tar.gz
+    # Priority: gnu libc > musl static > plain binary; skip v3 (needs AVX-512) and .sha256
+    DOWNLOAD_URL=$(echo "$RELEASE_JSON" | python3 - "$TELEMT_ARCH" << 'PYEOF'
 import sys, json
+
 arch = sys.argv[1]
+
+def score(name):
+    n = name.lower()
+    if n.endswith('.sha256'):          return 99  # skip checksums
+    if arch not in n:                  return 98  # wrong arch
+    if 'linux' not in n:               return 97  # wrong OS
+    if 'v3' in n:                      return 50  # AVX-512 variant — skip unless only option
+    if n.endswith('.tar.gz'):
+        if 'gnu' in n:                 return 1   # best: standard glibc
+        if 'musl' in n:                return 2   # ok: static musl
+        return 3
+    if n == 'telemt':                  return 10  # plain binary fallback
+    return 5
+
 try:
     data = json.load(sys.stdin)
     assets = data.get('assets', [])
-
-    def score(name):
-        # Lower = higher priority
-        if name.endswith('.sha256'):        return 99   # skip checksums
-        if arch not in name:               return 98   # wrong arch
-        if 'linux' not in name:            return 97   # wrong OS
-        if 'v3' in name:                   return 10   # x86_64-v3 = needs AVX512, skip
-        if name.endswith('.tar.gz'):
-            if 'gnu' in name:              return 1    # best: gnu libc
-            if 'musl' in name:             return 2    # ok: static musl
-            return 3
-        return 5  # plain binary
-
-    candidates = [(score(a['name']), a) for a in assets]
-    candidates.sort(key=lambda x: x[0])
-    for s, a in candidates:
+    ranked = sorted([(score(a['name']), a['name'], a['browser_download_url'])
+                     for a in assets], key=lambda x: x[0])
+    for s, name, url in ranked:
         if s < 90:
-            print(a['browser_download_url'])
-            break
-
-    # Last resort: asset literally named "telemt" (bare binary)
-    for a in assets:
-        if a['name'] == 'telemt':
-            print(a['browser_download_url'])
-            break
+            sys.stderr.write(f"  Selected: {name} (score={s})\n")
+            print(url)
+            sys.exit(0)
+    sys.stderr.write("No suitable asset found\n")
 except Exception as e:
     sys.stderr.write(f"Asset parse error: {e}\n")
-EOF
+PYEOF
 )
 
-if [ -z "$DOWNLOAD_URL" ]; then
-    echo -e "${RED}  Cannot find telemt binary for linux/$TELEMT_ARCH${NC}"
-    echo "  Available assets:"
-    echo "$RELEASE_JSON" | python3 -c \
-        "import sys,json; [print('   ', a['name']) for a in json.load(sys.stdin).get('assets',[])]" 2>/dev/null
-    echo ""
-    echo "  Manual install steps:"
-    echo "    1. Download the right binary from https://github.com/telemt/telemt/releases"
-    echo "    2. Place it at /usr/local/bin/telemt"
-    echo "    3. chmod +x /usr/local/bin/telemt"
-    echo "    4. Re-run this script"
-    exit 1
-fi
-
-echo "  Downloading: $DOWNLOAD_URL"
-TMP_FILE="/tmp/telemt_download"
-curl -L --max-time 60 -o "$TMP_FILE" "$DOWNLOAD_URL" 2>/dev/null
-
-if [ $? -ne 0 ] || [ ! -s "$TMP_FILE" ]; then
-    echo -e "${RED}  Download failed${NC}"; exit 1
-fi
-
-# Install binary (handle .tar.gz or direct binary)
-if file "$TMP_FILE" 2>/dev/null | grep -q "gzip\|tar"; then
-    tar -xzf "$TMP_FILE" -C /tmp/ 2>/dev/null
-    EXTRACTED=$(find /tmp -maxdepth 2 -name "telemt" -type f 2>/dev/null | head -1)
-    if [ -n "$EXTRACTED" ]; then
-        mv "$EXTRACTED" "$TELEMT_BIN"
-    else
-        echo -e "${RED}  Cannot find telemt binary in archive${NC}"; exit 1
+    if [ -z "$DOWNLOAD_URL" ]; then
+        echo -e "${RED}  Cannot find telemt binary for $TELEMT_ARCH${NC}"
+        echo "  Available assets:"
+        echo "$RELEASE_JSON" | python3 -c \
+            "import sys,json; [print('   ', a['name']) for a in json.load(sys.stdin).get('assets',[])]" 2>/dev/null
+        echo ""
+        echo "  Manual steps:"
+        echo "    curl -L -o /usr/local/bin/telemt \\"
+        echo "      https://github.com/telemt/telemt/releases/latest/download/telemt-x86_64-linux-gnu.tar.gz"
+        echo "    # Extract and place binary at /usr/local/bin/telemt"
+        echo "    chmod +x /usr/local/bin/telemt && bash $0"
+        exit 1
     fi
-else
-    mv "$TMP_FILE" "$TELEMT_BIN"
-fi
 
-chmod +x "$TELEMT_BIN"
-rm -f "$TMP_FILE" 2>/dev/null
+    echo "  Downloading: $DOWNLOAD_URL"
+    TMP_ARCHIVE="/tmp/telemt_download_$$.tar.gz"
+    TMP_DIR="/tmp/telemt_extract_$$"
 
-if "$TELEMT_BIN" --version 2>/dev/null | grep -q "telemt\|version" || [ -x "$TELEMT_BIN" ]; then
+    curl -L --max-time 120 --progress-bar -o "$TMP_ARCHIVE" "$DOWNLOAD_URL"
+    if [ $? -ne 0 ] || [ ! -s "$TMP_ARCHIVE" ]; then
+        echo -e "${RED}  Download failed${NC}"; rm -f "$TMP_ARCHIVE"; exit 1
+    fi
+
+    # Extract — handle .tar.gz or direct binary
+    if file "$TMP_ARCHIVE" | grep -q "gzip\|tar"; then
+        mkdir -p "$TMP_DIR"
+        tar -xzf "$TMP_ARCHIVE" -C "$TMP_DIR" 2>/dev/null
+
+        # Find the binary — search up to depth 5 to handle any archive structure
+        EXTRACTED=$(find "$TMP_DIR" -maxdepth 5 -name "telemt" -type f 2>/dev/null | head -1)
+
+        if [ -z "$EXTRACTED" ]; then
+            echo -e "${RED}  Cannot find telemt binary in archive. Contents:${NC}"
+            find "$TMP_DIR" -maxdepth 3 | sed 's/^/    /'
+            rm -rf "$TMP_ARCHIVE" "$TMP_DIR"; exit 1
+        fi
+
+        mv "$EXTRACTED" "$TELEMT_BIN"
+        rm -rf "$TMP_DIR"
+    else
+        # Direct binary (asset named "telemt" with no extension)
+        mv "$TMP_ARCHIVE" "$TELEMT_BIN"
+    fi
+
+    rm -f "$TMP_ARCHIVE"
+    chmod +x "$TELEMT_BIN"
+
+    if [ ! -x "$TELEMT_BIN" ]; then
+        echo -e "${RED}  telemt binary not executable${NC}"; exit 1
+    fi
     echo -e "  ${GREEN}✓ telemt installed: $TELEMT_VERSION${NC}"
-else
-    echo -e "${RED}  telemt binary not working — check manually: $TELEMT_BIN --version${NC}"
-    exit 1
 fi
 echo ""
 
@@ -297,27 +307,28 @@ echo ""
 echo -e "${BLUE}[7/9] Generating secrets and writing config...${NC}"
 echo ""
 
-# Generate secrets for default users
 SECRET_USER1=$(openssl rand -hex 16)
 SECRET_USER2=$(openssl rand -hex 16)
 
-# Save for reference
 mkdir -p "$TELEMT_CONFIG_DIR"
+
+# Save raw secrets for reference
 cat > "$TELEMT_CONFIG_DIR/users.txt" << USERS
 # telemt user secrets — generated $(date '+%Y-%m-%d %H:%M:%S UTC')
-# Format for Telegram: tg://proxy?server=IP&port=PORT&secret=ee<SECRET><DOMAIN_HEX>
-# Use the full link from: curl -s http://127.0.0.1:9091/v1/users | jq
+# Full tg:// links: curl -s http://127.0.0.1:9091/v1/users | jq
 user1 = $SECRET_USER1
 user2 = $SECRET_USER2
 USERS
 chmod 600 "$TELEMT_CONFIG_DIR/users.txt"
 
-# Save info for monitoring
-echo "$PORT"        > /etc/telemt/port
-echo "$SERVER_IP"   > /etc/telemt/server-ip
-echo "$MASK_DOMAIN" > /etc/telemt/mask-domain
+# Monitoring metadata
+echo "$PORT"        > "$TELEMT_CONFIG_DIR/port"
+echo "$SERVER_IP"   > "$TELEMT_CONFIG_DIR/server-ip"
+echo "$MASK_DOMAIN" > "$TELEMT_CONFIG_DIR/mask-domain"
 
 # Write telemt.toml
+# NOTE: heredoc without quotes (<<TOML) so bash variables expand inside.
+# Secrets are hex-only (openssl rand -hex 16) — safe for TOML string values.
 cat > "$TELEMT_CONFIG" << TOML
 # ============================================================
 # telemt configuration — generated $(date '+%Y-%m-%d %H:%M:%S UTC')
@@ -325,87 +336,78 @@ cat > "$TELEMT_CONFIG" << TOML
 # ============================================================
 
 [general]
-# use_middle_proxy = true allows ad sponsorship via @MTProxybot
-# Set to false if you want to use Shadowsocks upstream instead
 use_middle_proxy = true
 
 [general.modes]
-# classic = false  — obsolete, detectable
-# secure  = false  — dd-prefix, also detectable
-# tls     = true   — TCP Splice mode: real cert + real handshake to mask host
+# classic — obsolete plain MTProto, detectable
+# secure  — dd-prefix obfuscation, still detectable by DPI
+# tls     — TCP Splice: real TLS cert+handshake from mask host
 classic = false
 secure  = false
 tls     = true
 
 [general.tls]
-# The domain that unrecognized connections are spliced to.
-# DPI scanners and crawlers get a REAL TLS response from this domain:
-#   - real certificate chain
-#   - real TLS handshake
-#   - real HTTP response
-# This is NOT FakeTLS — telemt connects to the actual host.
+# Connections without a valid secret are spliced to this domain.
+# DPI scanners and crawlers receive:
+#   - real TLS certificate chain (not self-signed, not fake)
+#   - real TLS 1.3 handshake
+#   - real HTTP response from the domain
+# JA3/JA4 fingerprint is indistinguishable from a real browser.
 domain = "$MASK_DOMAIN"
 
 [server]
-# Port to listen on (use 443 to look like HTTPS)
 port    = $PORT
-# Bind to all interfaces
 host    = "0.0.0.0"
 
-# Management API — used by monitoring script and /v1/users endpoint
-# Keep this localhost-only
+# Management API — localhost only, used for /v1/users links
 api_port = 9091
 api_host = "127.0.0.1"
 
-# Metrics endpoint (optional, localhost only by default)
+# Prometheus metrics — localhost only
 metrics_port      = 9090
 metrics_whitelist = ["127.0.0.1/32", "::1/128"]
 
-# Maximum concurrent connections (0 = unlimited)
 max_connections = 10000
 
 [access.users]
-# Each user has their own 32-char hex secret.
-# Full connection link (with ee-prefix + domain) is in:
-#   curl -s http://127.0.0.1:9091/v1/users | jq
-#
 # Add more users: openssl rand -hex 16
-# No restart needed after adding users.
+# No service restart needed after adding users.
 user1 = "$SECRET_USER1"
 user2 = "$SECRET_USER2"
 
-# Optionally limit unique IPs per user:
 # [access.user_max_unique_ips]
-# user1 = 3   # max 3 devices per link
+# user1 = 3   # limit to 3 devices per link
 
-# Optionally set per-user ad tags (for @MTProxybot sponsorship):
 # [access.user_ad_tags]
-# user1 = "your_ad_tag_here"
+# user1 = "tag_from_mtproxybot"
 
 [censorship]
-# If a client connects with an SNI that doesn't match our domain,
-# splice them to the mask host anyway (don't return an error).
-# This prevents "Unknown TLS SNI" errors during domain transitions.
+# Splice unrecognized SNI connections to mask host instead of returning error.
+# Prevents "Unknown TLS SNI" errors if clients use old links after domain change.
 unknown_sni_action = "mask"
 TOML
-
 chmod 600 "$TELEMT_CONFIG"
 
 echo -e "  ${MAGENTA}Config:${NC}"
 echo "  Mask domain : $MASK_DOMAIN"
 echo "  User1 secret: $SECRET_USER1"
 echo "  User2 secret: $SECRET_USER2"
-echo "  Config file : $TELEMT_CONFIG"
-echo "  (Full tg:// links available after start via API)"
+echo "  Config      : $TELEMT_CONFIG"
+echo "  (Full tg:// links via: curl -s http://127.0.0.1:9091/v1/users | jq)"
 echo ""
 
 # ============================================================
-# CREATE SYSTEMD SERVICE
+# SYSTEMD SERVICE
 # ============================================================
+# FIX: ReadWritePaths must include /var/run (monitor status file)
+# and /var/log (monitor log file). Without this, ProtectSystem=strict
+# would block writes to these paths if telemt itself needed them.
+# Monitor runs as root via cron so it's not affected, but being explicit is correct.
 cat > /etc/systemd/system/telemt.service << SERVICE
 [Unit]
 Description=telemt MTProxy (TCP Splice TLS)
-After=network.target
+Documentation=https://github.com/telemt/telemt
+After=network-online.target
 Wants=network-online.target
 
 [Service]
@@ -415,11 +417,10 @@ Restart=always
 RestartSec=5
 LimitNOFILE=65536
 
-# Security hardening
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=$TELEMT_CONFIG_DIR /var/log
+ReadWritePaths=$TELEMT_CONFIG_DIR /var/log /var/run
 
 [Install]
 WantedBy=multi-user.target
@@ -434,8 +435,7 @@ if systemctl is-active --quiet telemt; then
     echo -e "  ${GREEN}✓ telemt service running${NC}"
 else
     echo -e "${RED}  telemt failed to start${NC}"
-    echo "  Logs: journalctl -u telemt -n 30"
-    journalctl -u telemt -n 20 --no-pager 2>/dev/null | sed 's/^/  /'
+    journalctl -u telemt -n 30 --no-pager 2>/dev/null | sed 's/^/  /'
     exit 1
 fi
 echo ""
@@ -446,31 +446,27 @@ echo ""
 echo -e "${BLUE}[8/9] Installing monitoring...${NC}"
 echo ""
 
-# Write email/thresholds to config dir
-echo "${NOTIFY_EMAIL:-}" > /etc/telemt/notify-email
-echo "$LATENCY_WARN_MS"  > /etc/telemt/latency-warn
-echo "$LATENCY_CRIT_MS"  > /etc/telemt/latency-crit
+echo "${NOTIFY_EMAIL:-}" > "$TELEMT_CONFIG_DIR/notify-email"
+echo "$LATENCY_WARN_MS"  > "$TELEMT_CONFIG_DIR/latency-warn"
+echo "$LATENCY_CRIT_MS"  > "$TELEMT_CONFIG_DIR/latency-crit"
 
 cat > /usr/local/bin/mtproxy-monitor << 'PYEOF'
 #!/usr/bin/env python3
 """
 MTProxy Monitor (telemt) — detects ТСПУ degradation before full block.
 
-ТСПУ two-stage blocking (from ТСПУ architecture docs):
-  Stage 1: DPI detects protocol → logs sent to ЦСУ
-           'protocols capacity' drops packets → TCP retransmits → LATENCY RISES
-  Stage 2: IP:port added to cleaned blocklist → hard block
-  Window between stages: 5-15 minutes.
+ТСПУ two-stage blocking:
+  Stage 1: DPI detects protocol → logs → ЦСУ analysis
+           protocols capacity (2-10%) drops packets → TCP retransmits → LATENCY RISES
+  Stage 2: IP:port added to cleaned blocklist → hard block (behavior: block)
+  Window: 5-15 minutes between stages.
 
-With telemt TCP Splice, DPI scanners see a real TLS session to the mask host.
-Stage 1 detection is much harder. But IP-based blocking (Stage 2 via Eco Highway)
-still applies once the ЦСУ accumulates enough logs.
-
-We detect early by measuring latency from Russian nodes every 15 minutes.
+With telemt TCP Splice, DPI sees real TLS → Stage 1 detection is harder.
+IP-based blocking (Eco Highway BGP) still applies if ЦСУ accumulates logs.
 """
 
-import json, time, sys, os, socket, datetime, subprocess
-import urllib.request, urllib.error
+import json, time, sys, socket, datetime, subprocess
+import urllib.request
 
 def read_cfg(f, default=''):
     try: return open(f).read().strip()
@@ -478,7 +474,6 @@ def read_cfg(f, default=''):
 
 SERVER_IP        = read_cfg('/etc/telemt/server-ip')
 PORT             = int(read_cfg('/etc/telemt/port', '443'))
-MASK_DOMAIN      = read_cfg('/etc/telemt/mask-domain', 'www.bing.com')
 LOG_FILE         = '/var/log/mtproxy-monitor.log'
 STATUS_FILE      = '/var/run/mtproxy-monitor.status'
 NOTIFY_EMAIL     = read_cfg('/etc/telemt/notify-email')
@@ -516,17 +511,16 @@ def send_alert(subject, body):
     try:
         subprocess.run(['mail', '-s', subject, NOTIFY_EMAIL],
                        input=body, text=True, timeout=15)
-        log(f"Alert sent to {NOTIFY_EMAIL}: {subject}")
+        log(f"Alert sent: {subject}")
     except Exception as e:
-        log(f"Alert send failed: {e}", 'WARN')
+        log(f"Alert failed: {e}", 'WARN')
 
 def check_service():
-    """Check telemt systemd service status."""
     try:
         r = subprocess.run(['systemctl', 'is-active', 'telemt'],
                            capture_output=True, text=True, timeout=5)
-        active = r.stdout.strip() == 'active'
-        return active, r.stdout.strip()
+        st = r.stdout.strip()
+        return st == 'active', st
     except:
         return False, 'error'
 
@@ -543,18 +537,15 @@ def check_local_port():
         return False, str(e)
 
 def check_api():
-    """Check telemt management API — get active connections count."""
     try:
         req = urllib.request.Request('http://127.0.0.1:9091/v1/users',
                                      headers={'Accept': 'application/json'})
         with urllib.request.urlopen(req, timeout=5) as r:
-            data = json.loads(r.read())
-        return True, data
+            return True, json.loads(r.read())
     except:
         return False, None
 
 def check_from_russia():
-    """Measure latency from Russian check-host.net nodes."""
     url = f"https://check-host.net/check-tcp?host={SERVER_IP}:{PORT}"
     for n in RU_NODES: url += f"&node={n}"
     try:
@@ -599,37 +590,29 @@ def check_from_russia():
 log("=== Monitor check started ===")
 last = get_last_status()
 
-# 1. Service running?
+# 1. Service
 svc_ok, svc_st = check_service()
 if not svc_ok:
     log(f"SERVICE DOWN: {svc_st}", 'CRIT')
     if last != 'CRIT':
-        send_alert(
-            "[MTProxy] CRITICAL: telemt service not running",
-            f"Server: {SERVER_IP}:{PORT}\nStatus: {svc_st}\n\n"
-            f"Fix: systemctl restart telemt\n"
-            f"Logs: journalctl -u telemt -n 50"
-        )
+        send_alert("[MTProxy] CRITICAL: telemt service not running",
+                   f"Server: {SERVER_IP}:{PORT}\nStatus: {svc_st}\n\n"
+                   f"Fix: systemctl restart telemt\n"
+                   f"Logs: journalctl -u telemt -n 50")
     save_status('CRIT'); sys.exit(2)
 log(f"Service: {svc_st}")
 
-# 2. Management API
-api_ok, api_data = check_api()
-if api_ok:
-    log(f"API: ok ({type(api_data).__name__})")
-else:
-    log("API: not responding (may be starting up)", 'WARN')
+# 2. API
+api_ok, _ = check_api()
+log(f"API: {'ok' if api_ok else 'not responding (may be starting)'}")
 
-# 3. Local TCP port
+# 3. Local port
 local_ok, local_ms = check_local_port()
 if not local_ok:
     log(f"LOCAL PORT FAILED: {local_ms}", 'CRIT')
     if last != 'CRIT':
-        send_alert(
-            "[MTProxy] CRITICAL: Port not responding",
-            f"Port {PORT} on {SERVER_IP} not responding.\nError: {local_ms}\n\n"
-            f"Fix: systemctl restart telemt"
-        )
+        send_alert("[MTProxy] CRITICAL: Port not responding",
+                   f"Port {PORT} on {SERVER_IP}: {local_ms}\n\nFix: systemctl restart telemt")
     save_status('CRIT'); sys.exit(2)
 log(f"Local TCP: {local_ms}ms")
 
@@ -643,17 +626,15 @@ warn_lat   = [(n, ms) for n, ms in ok_nodes if isinstance(ms, float) and ms > LA
 
 for node, status, ms in ru:
     if status is True:
-        flag = ''
-        if isinstance(ms, float):
-            if ms > LATENCY_CRIT_MS:   flag = ' ← HIGH (ТСПУ degradation?)'
-            elif ms > LATENCY_WARN_MS: flag = ' ← elevated'
+        flag = (' ← HIGH (ТСПУ degradation?)' if isinstance(ms, float) and ms > LATENCY_CRIT_MS
+                else ' ← elevated' if isinstance(ms, float) and ms > LATENCY_WARN_MS else '')
         log(f"  {node}: {ms}ms{flag}")
     elif status is False:
         log(f"  {node}: BLOCKED ({ms})", 'WARN')
     else:
         log(f"  {node}: {ms}")
 
-# ---- Status ----
+# ---- Determine status ----
 if fail_nodes and len(fail_nodes) == len(ru) and ru:
     status = 'CRIT'
     log("STATUS: CRITICAL — fully blocked from Russia", 'CRIT')
@@ -661,86 +642,75 @@ if fail_nodes and len(fail_nodes) == len(ru) and ru:
         send_alert(
             "[MTProxy] CRITICAL: Fully blocked from Russia",
             f"MTProxy {SERVER_IP}:{PORT} unreachable from all Russian nodes.\n\n"
-            f"IP:port is in ТСПУ blocklist (Stage 2).\n\n"
+            f"IP:port is in ТСПУ blocklist (Stage 2 complete).\n\n"
             f"Results:\n" + "\n".join(f"  {n}: {m}" for n,m in fail_nodes) +
-            f"\n\nActions (in order of effectiveness):\n"
+            f"\n\nActions:\n"
             f"  1. Change VPS IP — most effective\n"
             f"  2. Change mask domain: bash /root/mtproxy_install.sh {PORT} www.apple.com\n"
             f"  3. Change port: bash /root/mtproxy_install.sh 8443\n\n"
-            f"Service is still running — only external IP:port is blocked."
-        )
+            f"Service is still running — only external IP:port is blocked.")
 
 elif crit_lat:
     status = 'WARN'
     avg_ms = round(sum(ms for _,ms in crit_lat)/len(crit_lat), 1)
-    log(f"STATUS: WARNING — latency {avg_ms}ms (ТСПУ Stage 1 degradation possible)", 'WARN')
+    log(f"STATUS: WARNING — latency {avg_ms}ms (ТСПУ Stage 1 degradation)", 'WARN')
     if last not in ('WARN', 'CRIT'):
         send_alert(
             f"[MTProxy] WARNING: Latency {avg_ms}ms — ТСПУ degradation signal",
-            f"MTProxy {SERVER_IP}:{PORT} — HIGH LATENCY from Russia.\n\n"
-            f"Average: {avg_ms}ms  (critical threshold: {LATENCY_CRIT_MS}ms)\n\n"
+            f"MTProxy {SERVER_IP}:{PORT} — HIGH LATENCY from Russia.\n"
+            f"Average: {avg_ms}ms (threshold: {LATENCY_CRIT_MS}ms)\n\n"
             f"Nodes:\n" + "\n".join(f"  {n}: {ms}ms" for n,ms in crit_lat) +
-            f"\n\nWith telemt TCP Splice this is unusual — it may indicate:\n"
-            f"  a) General routing degradation to your VPS\n"
-            f"  b) ТСПУ Stage 1 beginning (IP:port recognition)\n\n"
-            f"Full block (Stage 2) may follow in 5-15 minutes.\n"
-            f"Monitor the next check in 15 minutes."
-        )
+            f"\n\nWith telemt TCP Splice this is unusual. Possible causes:\n"
+            f"  a) General VPS routing degradation\n"
+            f"  b) ТСПУ Stage 1 beginning\n\n"
+            f"Full block may follow in 5-15 min. Monitor next check.")
 
 elif fail_nodes and ok_nodes:
     status = 'WARN'
     log("STATUS: WARNING — partial block (ISP-level)", 'WARN')
     if last not in ('WARN', 'CRIT'):
-        send_alert(
-            "[MTProxy] WARNING: Partial block from Russia",
-            f"Reachable: {', '.join(n for n,_ in ok_nodes)}\n"
-            f"Blocked:   {', '.join(n for n,_ in fail_nodes)}\n\n"
-            f"May be ISP-level block or routing issue."
-        )
+        send_alert("[MTProxy] WARNING: Partial block from Russia",
+                   f"Reachable: {', '.join(n for n,_ in ok_nodes)}\n"
+                   f"Blocked:   {', '.join(n for n,_ in fail_nodes)}\n\n"
+                   f"May be ISP-level block or routing issue.")
 
 elif warn_lat:
     avg_ms = round(sum(ms for _,ms in warn_lat)/len(warn_lat), 1)
     status = 'WARN_LATENCY'
-    log(f"STATUS: ELEVATED LATENCY — avg {avg_ms}ms (watching)")
+    log(f"STATUS: ELEVATED LATENCY — avg {avg_ms}ms (watching, no alert)")
 
 else:
     status = 'OK'
     avg_ms = round(sum(ms for _,ms in ok_nodes)/len(ok_nodes), 1) if ok_nodes else 0
     log(f"STATUS: OK — avg latency from Russia: {avg_ms}ms")
     if last in ('WARN', 'CRIT'):
-        send_alert(
-            "[MTProxy] RECOVERED: Proxy accessible from Russia",
-            f"MTProxy {SERVER_IP}:{PORT} is reachable again.\nPrevious status: {last}"
-        )
+        send_alert("[MTProxy] RECOVERED: Proxy accessible from Russia",
+                   f"MTProxy {SERVER_IP}:{PORT} is reachable again.\nPrevious: {last}")
 
 save_status(status)
 log("=== Check complete ===\n")
-sys.exit(0 if status in ('OK','WARN_LATENCY') else (1 if status=='WARN' else 2))
+sys.exit(0 if status in ('OK', 'WARN_LATENCY') else (1 if status == 'WARN' else 2))
 PYEOF
 
 chmod +x /usr/local/bin/mtproxy-monitor
 
-# Email config
 if [ -n "$NOTIFY_EMAIL" ]; then
-    echo "$NOTIFY_EMAIL" > /etc/telemt/notify-email
+    echo "$NOTIFY_EMAIL" > "$TELEMT_CONFIG_DIR/notify-email"
     echo -e "  ${GREEN}✓ Alert email: $NOTIFY_EMAIL${NC}"
 else
-    echo "" > /etc/telemt/notify-email
-    echo -e "  ${YELLOW}⚠ No alert email. Set with:${NC}"
-    echo "    echo 'you@example.com' > /etc/telemt/notify-email"
+    echo "" > "$TELEMT_CONFIG_DIR/notify-email"
+    echo -e "  ${YELLOW}⚠ No alert email. Set: echo 'you@example.com' > /etc/telemt/notify-email${NC}"
 fi
 
-# Cron every 15 min
-cat > /etc/cron.d/mtproxy-monitor << CRON
-# MTProxy / telemt monitoring — latency from Russian nodes every 15 min
+cat > /etc/cron.d/mtproxy-monitor << 'CRON'
+# MTProxy / telemt — latency check from Russian nodes every 15 min
 # Detects ТСПУ Stage 1 degradation before Stage 2 full block
 # Log: /var/log/mtproxy-monitor.log
 */15 * * * * root /usr/local/bin/mtproxy-monitor >> /var/log/mtproxy-monitor.log 2>&1
 CRON
 chmod 644 /etc/cron.d/mtproxy-monitor
 
-# Log rotation
-cat > /etc/logrotate.d/mtproxy-monitor << LOGROTATE
+cat > /etc/logrotate.d/mtproxy-monitor << 'LOGROTATE'
 /var/log/mtproxy-monitor.log {
     daily
     rotate 30
@@ -752,8 +722,8 @@ cat > /etc/logrotate.d/mtproxy-monitor << LOGROTATE
 LOGROTATE
 
 echo -e "  ${GREEN}✓ Monitor: /usr/local/bin/mtproxy-monitor${NC}"
-echo -e "  ${GREEN}✓ Cron: every 15 min${NC}"
-echo -e "  ${GREEN}✓ Log: /var/log/mtproxy-monitor.log${NC}"
+echo -e "  ${GREEN}✓ Cron: every 15 min (/etc/cron.d/mtproxy-monitor)${NC}"
+echo -e "  ${GREEN}✓ Log: /var/log/mtproxy-monitor.log (30-day rotation)${NC}"
 echo ""
 
 # ============================================================
@@ -763,7 +733,8 @@ echo -e "${BLUE}[9/9] Verification...${NC}"
 echo ""
 
 echo "  [9a] Service status:"
-systemctl status telemt --no-pager -l 2>/dev/null | grep -E "Active|Main PID|Loaded" | sed 's/^/    /'
+systemctl status telemt --no-pager -l 2>/dev/null \
+    | grep -E "Active|Main PID|Loaded" | sed 's/^/    /'
 echo ""
 
 echo "  [9b] Port $PORT listening:"
@@ -772,61 +743,58 @@ ss -tlnp | grep ":${PORT} " \
     || echo -e "    ${YELLOW}⚠ Not visible yet — check: journalctl -u telemt -n 20${NC}"
 echo ""
 
-echo "  [9c] Management API — connection links:"
-sleep 2
+echo "  [9c] Connection links (from API):"
+sleep 3
+# FIX: pipe API response via stdin to python — avoids shell string interpolation
+# and triple-quote injection risk with json.loads("""$VAR""")
 API_RESULT=$(curl -s --max-time 5 http://127.0.0.1:9091/v1/users 2>/dev/null)
 if [ -n "$API_RESULT" ]; then
     echo -e "    ${GREEN}✓ API responding${NC}"
-    echo "$API_RESULT" | python3 << PYEOF
+    echo "$API_RESULT" | python3 - << 'PYEOF'
 import sys, json
 try:
-    data = json.loads("""$API_RESULT""")
+    data = json.load(sys.stdin)
     if isinstance(data, list):
         for u in data:
             print(f"    User: {u.get('name','?')}")
-            print(f"    Link: {u.get('link','?')}")
+            print(f"    Link: {u.get('link', u.get('url','?'))}")
             print()
     elif isinstance(data, dict):
         for name, info in data.items():
+            link = info.get('link', info.get('url', '?')) if isinstance(info, dict) else str(info)
             print(f"    User: {name}")
-            if isinstance(info, dict):
-                print(f"    Link: {info.get('link', info.get('url','?'))}")
+            print(f"    Link: {link}")
             print()
 except Exception as e:
-    print(f"    (parse error: {e})")
-    print(f"    Raw: $API_RESULT")
+    print(f"    (parse error: {e} — run: curl -s http://127.0.0.1:9091/v1/users | jq)")
 PYEOF
 else
-    echo -e "    ${YELLOW}⚠ API not yet ready — get links manually:${NC}"
+    echo -e "    ${YELLOW}⚠ API not ready yet — run:${NC}"
     echo "    curl -s http://127.0.0.1:9091/v1/users | jq"
 fi
 echo ""
 
-echo "  [9d] Real TLS verification (TCP Splice test):"
-echo "       A scanner connecting without the secret should get real $MASK_DOMAIN cert."
+echo "  [9d] TCP Splice verification — scanner should get real $MASK_DOMAIN cert:"
 TLS=$(echo -n | openssl s_client \
     -connect "${SERVER_IP}:${PORT}" \
     -servername "$MASK_DOMAIN" \
     -timeout 8 2>&1)
-
 CERT_CN=$(echo "$TLS" | grep -oP "CN\s*=\s*\K[^\n,]+" | head -1)
 CERT_ISSUER=$(echo "$TLS" | grep "issuer" | head -1 | sed 's/^[[:space:]]*//')
-
 if echo "$TLS" | grep -q "SSL certificate verify ok"; then
     echo -e "    ${GREEN}✓ Real TLS — certificate verified OK${NC}"
     [ -n "$CERT_CN" ]     && echo "    CN    : $CERT_CN"
-    [ -n "$CERT_ISSUER" ] && echo "    Issuer: $CERT_ISSUER" | cut -c1-70
-    echo "    → DPI scanners see real $MASK_DOMAIN, NOT a fake TLS"
+    [ -n "$CERT_ISSUER" ] && echo "    ${CERT_ISSUER}" | cut -c1-72
+    echo "    → DPI sees real $MASK_DOMAIN (not fake TLS)"
 elif echo "$TLS" | grep -q "CONNECTED"; then
-    echo -e "    ${CYAN}ℹ TLS connected — cert details:${NC}"
+    echo -e "    ${CYAN}ℹ TLS connected${NC}"
     [ -n "$CERT_CN" ] && echo "    CN: $CERT_CN"
 else
-    echo -e "    ${YELLOW}⚠ TLS not yet confirmed — mask domain may need a moment${NC}"
-    echo "    Check: openssl s_client -connect ${SERVER_IP}:${PORT} -servername $MASK_DOMAIN"
+    echo -e "    ${YELLOW}⚠ TLS inconclusive — check: journalctl -u telemt -n 20${NC}"
 fi
 echo ""
 
-echo "  [9e] First monitoring check (takes ~20 sec):"
+echo "  [9e] First monitoring check (~20 sec):"
 /usr/local/bin/mtproxy-monitor 2>/dev/null \
     | grep -E "STATUS|latency|BLOCKED|Service|Local|CRIT|WARN|OK" \
     | sed 's/^/    /'
@@ -835,84 +803,70 @@ echo ""
 # ============================================================
 # FINAL OUTPUT
 # ============================================================
-
-# Get links from API if available
-API_LINKS=$(curl -s --max-time 5 http://127.0.0.1:9091/v1/users 2>/dev/null)
-
 echo "============================================================"
-echo -e "${GREEN} ✓ MTProxy telemt v3.0 — installation complete!${NC}"
+echo -e "${GREEN} ✓ MTProxy telemt v3.1 — installation complete!${NC}"
 echo "============================================================"
 echo ""
 echo -e "${CYAN} Architecture:${NC}"
-echo "  Mode         : TCP Splice (NOT FakeTLS)"
-echo "  Mask domain  : $MASK_DOMAIN"
-echo "  With secret  → MTProxy (Telegram)"
-echo "  Without scrt → real TLS to $MASK_DOMAIN (real cert)"
-echo "  DPI/scanner  → sees real $MASK_DOMAIN, JA3/JA4 fingerprint = real"
+echo "  Mode        : TCP Splice"
+echo "  Mask domain : $MASK_DOMAIN"
+echo "  With secret → Telegram MTProxy"
+echo "  Without key → real TLS to $MASK_DOMAIN (real cert, real fingerprint)"
+echo "  DPI scanner → sees $MASK_DOMAIN, JA3/JA4 = real browser"
 echo ""
 echo -e "${CYAN} Connection links:${NC}"
-if [ -n "$API_LINKS" ]; then
-    echo "$API_LINKS" | python3 << PYEOF 2>/dev/null
+curl -s --max-time 5 http://127.0.0.1:9091/v1/users 2>/dev/null | python3 - << 'PYEOF'
 import sys, json
 try:
-    data = json.loads("""$API_LINKS""")
+    data = json.load(sys.stdin)
     if isinstance(data, list):
         for u in data:
-            print(f"  {u.get('name','user')}: {u.get('link','?')}")
+            print(f"  {u.get('name','user')}: {u.get('link', u.get('url','?'))}")
     elif isinstance(data, dict):
         for name, info in data.items():
             link = info.get('link', info.get('url','?')) if isinstance(info,dict) else '?'
             print(f"  {name}: {link}")
-except Exception as e:
-    print(f"  (cannot parse API response)")
+except:
+    print("  curl -s http://127.0.0.1:9091/v1/users | jq")
 PYEOF
-else
-    echo "  curl -s http://127.0.0.1:9091/v1/users | jq"
-fi
 echo ""
 echo -e "${CYAN} Telegram manual setup:${NC}"
 echo "  Settings → Privacy → Use Proxy → Add Proxy → MTProto"
 echo "  Server : $SERVER_IP"
 echo "  Port   : $PORT"
-echo "  Secret : (use full secret from links above, with ee prefix)"
+echo "  Secret : (use full ee-prefixed secret from links above)"
 echo ""
 echo -e "${CYAN} Monitoring:${NC}"
-echo "  Run check now  : mtproxy-monitor"
-echo "  Watch log live : tail -f /var/log/mtproxy-monitor.log"
-echo "  Schedule       : every 15 min"
-if [ -n "$NOTIFY_EMAIL" ]; then
-    echo "  Alert email    : $NOTIFY_EMAIL"
-else
-    echo "  Alert email    : echo 'you@example.com' > /etc/telemt/notify-email"
-fi
+echo "  Run now    : mtproxy-monitor"
+echo "  Live log   : tail -f /var/log/mtproxy-monitor.log"
+echo "  Schedule   : every 15 min"
+[ -n "$NOTIFY_EMAIL" ] \
+    && echo "  Email      : $NOTIFY_EMAIL" \
+    || echo "  Email      : echo 'you@example.com' > /etc/telemt/notify-email"
 echo ""
 echo -e "${CYAN} Latency thresholds:${NC}"
-echo "  >$LATENCY_WARN_MS ms = WARNING (elevated, logged)"
-echo "  >$LATENCY_CRIT_MS ms = CRITICAL alert (ТСПУ degradation)"
-echo "  no connect    = CRITICAL alert (full block)"
+echo "  > ${LATENCY_WARN_MS}ms = WARN_LATENCY (logged, no alert)"
+echo "  > ${LATENCY_CRIT_MS}ms = WARNING email (ТСПУ Stage 1)"
+echo "  no connect = CRITICAL email (ТСПУ Stage 2 full block)"
 echo ""
-echo -e "${CYAN} Managing users:${NC}"
-echo "  Get all links  : curl -s http://127.0.0.1:9091/v1/users | jq"
-echo "  Add user       : add to $TELEMT_CONFIG [access.users]"
-echo "                   (no restart needed)"
-echo "  New secret     : openssl rand -hex 16"
+echo -e "${CYAN} Users & links:${NC}"
+echo "  All links  : curl -s http://127.0.0.1:9091/v1/users | jq"
+echo "  Add user   : edit $TELEMT_CONFIG → [access.users] (no restart)"
+echo "  New secret : openssl rand -hex 16"
 echo ""
-echo -e "${CYAN} Service management:${NC}"
+echo -e "${CYAN} Service:${NC}"
 echo "  Status  : systemctl status telemt"
 echo "  Logs    : journalctl -u telemt -f"
 echo "  Restart : systemctl restart telemt"
 echo "  Config  : $TELEMT_CONFIG"
 echo ""
-echo -e "${CYAN} Add @MTProxybot sponsorship:${NC}"
-echo "  1. @MTProxybot → /newproxy → ${SERVER_IP}:${PORT}"
-echo "  2. Send user secret from users.txt"
-echo "  3. Copy tag from bot → add to $TELEMT_CONFIG:"
-echo "     [general]"
-echo "     ad_tag = \"<tag_from_bot>\""
-echo "  4. systemctl restart telemt"
-echo ""
-echo -e "${CYAN} Change mask domain (if blocked):${NC}"
-echo "  bash $0 $PORT www.apple.com"
+echo -e "${CYAN} If blocked — action order:${NC}"
+echo "  1. CRITICAL latency alert → watch next 15-min check"
+echo "  2. Full block → change VPS IP (most effective)"
+echo "  3. Alternative → change mask domain:"
+echo "     bash $0 $PORT www.apple.com"
+echo "  4. Last resort → change port: bash $0 8443"
+echo "  ✗ Secret rotation — does NOT help (ТСПУ blocks IP:port)"
 echo ""
 echo -e "${CYAN} Recommended mask domains:${NC}"
 for d in "${GOOD_MASK_DOMAINS[@]}"; do
@@ -920,10 +874,5 @@ for d in "${GOOD_MASK_DOMAINS[@]}"; do
         && echo -e "  ${GREEN}→ $d (current)${NC}" \
         || echo "    $d"
 done
-echo ""
-echo -e "${YELLOW} When to act:${NC}"
-echo "  Latency warning : watch next 15-min check"
-echo "  Full block      : change VPS IP (most effective)"
-echo "  Secret rotation : NOT needed — ТСПУ blocks IP:port, not secret"
 echo "============================================================"
 echo ""
