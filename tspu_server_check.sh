@@ -1,8 +1,13 @@
 #!/bin/bash
 # ============================================================
-# TSPU Server Checker v4
-# Checks if this server is blocked by Russian ISPs (TSPU/DPI)
-# Run on any VPS: bash tspu_server_check.sh
+# TSPU Server Checker v5
+# Checks if this VPS is reachable from Russia and diagnoses
+# ТСПУ blocking status (DPI detection, latency degradation).
+#
+# Run on any VPS: bash tspu_server_check.sh [port]
+#   port — port to test (default: 443)
+#
+# Supports: Ubuntu 20/22/24, Debian 11/12/13
 # ============================================================
 
 RED='\033[0;31m'
@@ -10,50 +15,41 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
 NC='\033[0m'
 
+TEST_PORT="${1:-443}"
+UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+
 # ============================================================
-# INSTALL DEPENDENCIES
+# HELPERS
 # ============================================================
-install_deps() {
-    local missing=0
-    command -v curl    &>/dev/null || missing=1
-    command -v python3 &>/dev/null || missing=1
+step() { echo -e "${BLUE}[$1/$TOTAL] $2${NC}"; }
+ok()   { echo -e "  ${GREEN}✓ $*${NC}"; }
+warn() { echo -e "  ${YELLOW}⚠ $*${NC}"; }
+fail() { echo -e "  ${RED}✗ $*${NC}"; }
+info() { echo "  $*"; }
 
-    [ $missing -eq 0 ] && return 0
+TOTAL=9
 
-    echo -e "${YELLOW}Installing dependencies...${NC}"
-    if command -v apt-get &>/dev/null; then
-        apt-get update -qq 2>/dev/null
-        apt-get install -y -qq curl python3 2>/dev/null
-    elif command -v dnf &>/dev/null; then
-        dnf install -y -q curl python3 2>/dev/null
-    elif command -v yum &>/dev/null; then
-        yum install -y -q curl python3 2>/dev/null
-    elif command -v apk &>/dev/null; then
-        apk add --quiet curl python3 2>/dev/null
-    elif command -v pacman &>/dev/null; then
-        pacman -Sy --noconfirm --quiet curl python3 2>/dev/null
-    else
-        echo -e "${RED}Unknown package manager — install curl python3 manually${NC}"
-        exit 1
+# ============================================================
+# DEPENDENCIES
+# ============================================================
+if ! command -v curl &>/dev/null || ! command -v python3 &>/dev/null; then
+    echo "Installing dependencies..."
+    if   command -v apt-get &>/dev/null; then apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl python3 2>/dev/null
+    elif command -v dnf     &>/dev/null; then dnf install -y -q curl python3 2>/dev/null
+    elif command -v yum     &>/dev/null; then yum install -y -q curl python3 2>/dev/null
+    elif command -v apk     &>/dev/null; then apk add --quiet curl python3 2>/dev/null
+    else echo "Unknown package manager — install curl python3 manually"; exit 1
     fi
-
-    if ! command -v curl &>/dev/null || ! command -v python3 &>/dev/null; then
-        echo -e "${RED}Failed to install dependencies${NC}"
-        exit 1
-    fi
-    echo -e "${GREEN}Dependencies installed${NC}"
-    echo ""
-}
-
-install_deps
+fi
 
 # ============================================================
 # GET SERVER IP
 # ============================================================
 SERVER_IP=""
-for URL in ifconfig.me api.ipify.org icanhazip.com ipecho.net/plain; do
+for URL in ifconfig.me api.ipify.org icanhazip.com; do
     SERVER_IP=$(curl -s --max-time 5 "$URL" 2>/dev/null | tr -d '[:space:]')
     [[ "$SERVER_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && break
     SERVER_IP=""
@@ -61,394 +57,527 @@ done
 
 echo ""
 echo "============================================================"
-echo " TSPU Server Checker v4"
+echo " TSPU Server Checker v5"
 echo "============================================================"
-echo " Server IP : ${SERVER_IP:-UNKNOWN - no internet access?}"
+echo " Server IP : ${SERVER_IP:-UNKNOWN}"
+echo " Test port : $TEST_PORT"
 echo " Date      : $(date '+%Y-%m-%d %H:%M:%S UTC')"
 echo "============================================================"
 echo ""
 
-if [ -z "$SERVER_IP" ]; then
-    echo -e "${RED}ERROR: Cannot determine server IP.${NC}"
-    echo " Try: curl ifconfig.me"
-    echo " Fix: ufw default allow outgoing && ufw reload"
-    echo ""
-fi
+[ -z "$SERVER_IP" ] && { fail "Cannot determine server IP. Check internet access."; echo ""; }
 
 # ============================================================
-# CHECK PORT FROM RUSSIA
+# FUNCTION: check port from Russia via check-host.net
+# FIX: uses temp file for Python script to avoid pipe+heredoc
+#      stdin conflict. Also adds User-Agent to avoid 403.
 # ============================================================
 check_port_from_russia() {
-    local IP=$1
-    local PORT=$2
-    local NODES="ru1.node.check-host.net&node=ru2.node.check-host.net&node=ru3.node.check-host.net"
+    local IP="$1"
+    local PORT="$2"
+    local URL="https://check-host.net/check-tcp?host=${IP}:${PORT}"
+    URL+="&node=ru1.node.check-host.net"
+    URL+="&node=ru2.node.check-host.net"
+    URL+="&node=ru3.node.check-host.net"
+    URL+="&node=msk.node.check-host.net"
 
-    local RESP=$(curl -s --max-time 10 \
+    local RESP
+    RESP=$(curl -s --max-time 12 \
         -H "Accept: application/json" \
-        "https://check-host.net/check-tcp?host=${IP}:${PORT}&node=${NODES}" 2>/dev/null)
+        -H "User-Agent: $UA" \
+        "$URL" 2>/dev/null)
 
-    local REQ_ID=$(python3 - "$RESP" << 'EOF'
+    local REQ_ID
+    REQ_ID=$(echo "$RESP" | python3 -c "
 import sys, json
-try: print(json.loads(sys.argv[1]).get('request_id', ''))
+try: print(json.load(sys.stdin).get('request_id', ''))
 except: print('')
-EOF
-)
+" 2>/dev/null)
 
     if [ -z "$REQ_ID" ]; then
-        echo "  Could not reach check-host.net"
+        warn "check-host.net unavailable (try: https://check-host.net/check-tcp#${IP}:${PORT})"
         return
     fi
 
-    sleep 12
+    sleep 13
 
-    local RESULT=$(curl -s --max-time 10 \
+    local RESULT
+    RESULT=$(curl -s --max-time 10 \
         -H "Accept: application/json" \
+        -H "User-Agent: $UA" \
         "https://check-host.net/check-result/${REQ_ID}" 2>/dev/null)
 
-    python3 - "$RESULT" "$PORT" << 'EOF'
+    # Write parser to temp file — avoids pipe+heredoc stdin conflict
+    local PARSER="/tmp/chk_parser_$$.py"
+    cat > "$PARSER" << 'PYEOF'
 import sys, json
 
-try:
-    d = json.loads(sys.argv[1])
-except:
-    print("  Could not parse result")
-    sys.exit()
+port = sys.argv[1]
+ok_count = 0
+blocked_count = 0
 
-port = sys.argv[2]
-ok = 0
-blocked = 0
+try:
+    d = json.load(sys.stdin)
+except:
+    print("  Could not parse check-host.net result")
+    sys.exit()
 
 for node, val in d.items():
     short = node.replace('.node.check-host.net', '')
     if val is None:
         print(f"  {short}: pending")
-    elif isinstance(val, list) and len(val) > 0:
+    elif isinstance(val, list) and val:
         v = val[0]
         if isinstance(v, dict) and 'time' in v:
             ms = round(v['time'] * 1000, 1)
-            print(f"  \033[32m{short}: Connected ({ms}ms)\033[0m")
-            ok += 1
-        elif isinstance(v, list) and len(v) > 0:
+            print(f"  \033[32m{short}: {ms}ms\033[0m")
+            ok_count += 1
+        elif isinstance(v, list):
             if v[0] == 'OK':
                 ms = round(v[1] * 1000, 1) if len(v) > 1 else 0
-                print(f"  \033[32m{short}: Connected ({ms}ms)\033[0m")
-                ok += 1
+                print(f"  \033[32m{short}: {ms}ms\033[0m")
+                ok_count += 1
             else:
                 print(f"  \033[31m{short}: {v[0]}\033[0m")
-                blocked += 1
+                blocked_count += 1
         else:
-            print(f"  \033[31m{short}: error - {v}\033[0m")
-            blocked += 1
+            print(f"  \033[31m{short}: error\033[0m")
+            blocked_count += 1
     else:
         print(f"  \033[31m{short}: no response\033[0m")
-        blocked += 1
+        blocked_count += 1
 
 print()
-total = ok + blocked
+total = ok_count + blocked_count
 if total == 0:
-    print("  RESULT: \033[33mNo results (pending)\033[0m")
-elif blocked == 0:
-    print(f"  RESULT: \033[32mNOT BLOCKED - port {port} accessible from Russia ✓\033[0m")
-elif ok == 0:
-    print(f"  RESULT: \033[31mBLOCKED - port {port} unreachable from Russia ✗\033[0m")
+    print("  \033[33mRESULT: pending — no results yet\033[0m")
+elif blocked_count == 0:
+    print(f"  \033[32mRESULT: NOT BLOCKED — port {port} accessible from Russia ✓\033[0m")
+elif ok_count == 0:
+    print(f"  \033[31mRESULT: BLOCKED — port {port} unreachable from Russia ✗\033[0m")
 else:
-    print(f"  RESULT: \033[33mPARTIAL - {ok} ok / {blocked} blocked\033[0m")
-EOF
+    print(f"  \033[33mRESULT: PARTIAL — {ok_count} ok / {blocked_count} blocked\033[0m")
+PYEOF
+
+    echo "$RESULT" | python3 "$PARSER" "$PORT"
+    rm -f "$PARSER"
 }
 
 # ============================================================
-# 1. GEO INFO
+# [1/9] GEO & IP INFO
 # ============================================================
-echo -e "${BLUE}[1/9] Server location${NC}"
+step 1 "Server location & IP classification"
 if [ -n "$SERVER_IP" ]; then
-    GEO=$(curl -s --max-time 5 "http://ip-api.com/json/${SERVER_IP}?fields=country,regionName,isp,as" 2>/dev/null)
+    GEO=$(curl -s --max-time 6 \
+        "http://ip-api.com/json/${SERVER_IP}?fields=country,regionName,city,isp,as,org,hosting" \
+        2>/dev/null)
+
     if [ -n "$GEO" ]; then
-        python3 - "$GEO" << 'EOF'
+        echo "$GEO" | python3 -c "
 import sys, json
 try:
-    d = json.loads(sys.argv[1])
-    print(f"  Country : {d.get('country','?')}")
-    print(f"  Region  : {d.get('regionName','?')}")
-    print(f"  ISP     : {d.get('isp','?')}")
-    print(f"  AS      : {d.get('as','?')}")
+    d = json.load(sys.stdin)
+    print(f\"  Country : {d.get('country','?')}\")
+    print(f\"  Region  : {d.get('regionName','?')}, {d.get('city','?')}\")
+    print(f\"  ISP     : {d.get('isp','?')}\")
+    print(f\"  AS      : {d.get('as','?')}\")
+    h = d.get('hosting', False)
+    if h:
+        print(f\"  \033[33m⚠ hosting=true — IP classified as datacenter/hosting\033[0m\")
+        print(f\"    Russian ISPs often target hosting IP ranges\")
+    else:
+        print(f\"  \033[32m✓ hosting=false — IP not classified as datacenter\033[0m\")
 except Exception as e:
-    print(f"  Could not parse geo info: {e}")
-EOF
+    print(f'  Could not parse: {e}')
+" 2>/dev/null
     else
-        echo "  Could not reach ip-api.com"
+        warn "Could not reach ip-api.com"
     fi
 else
-    echo "  Skipped - no IP"
+    warn "Skipped — no server IP"
 fi
 echo ""
 
 # ============================================================
-# 2. PORT 443
+# [2/9] PORT TEST FROM RUSSIA
 # ============================================================
-echo -e "${BLUE}[2/9] TCP port 443 from Russia${NC}"
+step 2 "TCP port $TEST_PORT from Russia (check-host.net)"
 if [ -n "$SERVER_IP" ]; then
-    echo " Checking... (waiting ~15 sec)"
-    check_port_from_russia "$SERVER_IP" "443"
+    info "Querying Russian nodes — waiting ~15 sec..."
+    check_port_from_russia "$SERVER_IP" "$TEST_PORT"
 else
-    echo "  Skipped - no IP"
+    warn "Skipped — no server IP"
 fi
 echo ""
 
 # ============================================================
-# 3. PORT 8443
+# [3/9] LOCAL LISTENING PORTS
 # ============================================================
-echo -e "${BLUE}[3/9] TCP port 8443 from Russia${NC}"
-if [ -n "$SERVER_IP" ]; then
-    echo " Checking... (waiting ~15 sec)"
-    check_port_from_russia "$SERVER_IP" "8443"
-else
-    echo "  Skipped - no IP"
-fi
-echo ""
-
-# ============================================================
-# 4. LOCAL OPEN PORTS
-# ============================================================
-echo -e "${BLUE}[4/9] Local open ports${NC}"
+step 3 "Local listening ports"
 FOUND=0
 for PORT in 80 443 2053 2083 2087 2096 2443 8080 8443 8880; do
     if ss -tlnp 2>/dev/null | grep -q ":${PORT} "; then
-        SVC=$(ss -tlnp 2>/dev/null | grep ":${PORT} " | grep -oP 'users:\(\("\K[^"]+' | head -1)
+        SVC=$(ss -tlnp 2>/dev/null | grep ":${PORT} " | \
+              grep -oP 'users:\(\("\K[^"]+' | head -1)
         echo -e "  ${GREEN}[OPEN]${NC} :${PORT}  (${SVC:-unknown})"
         FOUND=1
     fi
 done
-[ $FOUND -eq 0 ] && echo "  No ports open on standard ports"
+[ $FOUND -eq 0 ] && info "No services on standard ports"
 echo ""
 
 # ============================================================
-# 5. TSPU DPI — 19-SECOND DROP TEST
+# [4/9] PROXY PROCESS DETECTION
 # ============================================================
-echo -e "${BLUE}[5/9] TSPU DPI — 19-second connection drop signature${NC}"
-echo " Holding TCP connection to Telegram servers for 25 seconds..."
+step 4 "Proxy process detection"
 
-python3 << 'EOF'
+PROXY_FOUND=0
+
+# telemt
+if systemctl is-active --quiet telemt 2>/dev/null; then
+    TELEMT_VER=$(telemt --version 2>/dev/null | head -1 || echo "unknown")
+    ok "telemt is running ($TELEMT_VER)"
+    DOMAIN=$(cat /etc/telemt/mask-domain 2>/dev/null || \
+             grep -oP 'domain\s*=\s*"\K[^"]+' /etc/telemt/telemt.toml 2>/dev/null | head -1)
+    [ -n "$DOMAIN" ] && info "Mask domain: $DOMAIN"
+    info "Mode: TCP Splice (DPI-proof — real cert from mask domain)"
+    PROXY_FOUND=1
+fi
+
+# xray
+if pgrep -x xray &>/dev/null || pgrep -f "xray run" &>/dev/null; then
+    XRAY_BIN=$(which xray 2>/dev/null || find /usr/local/bin /opt -name xray 2>/dev/null | head -1)
+    VER=$($XRAY_BIN version 2>/dev/null | head -1)
+    ok "xray is running${VER:+ ($VER)}"
+    CONFS=$(find /usr/local/etc/xray /etc/xray /opt -name "*.json" 2>/dev/null | head -3)
+    for F in $CONFS; do
+        grep -q "xtls-rprx-vision" "$F" 2>/dev/null && ok "  Vision flow in $F"
+        grep -q "reality"          "$F" 2>/dev/null && ok "  Reality settings in $F"
+        grep -qE '"security":\s*"tls"' "$F" 2>/dev/null && \
+            warn "TLS mode in $F — if Reality intended, verify security setting"
+    done
+    PROXY_FOUND=1
+fi
+
+# sing-box
+if pgrep -f "sing-box" &>/dev/null; then
+    fail "sing-box detected — does NOT support xtls-rprx-vision (Vision flow)"
+    info "  Client error: 'vision: not a valid supported TLS connection'"
+    info "  Fix: migrate to xray"
+    PROXY_FOUND=1
+fi
+
+# official MTProxy Docker (old, detectable)
+if docker ps 2>/dev/null | grep -q "telegrammessenger/proxy"; then
+    fail "Official Telegram MTProxy Docker detected!"
+    info "  This image is DETECTABLE by ТСПУ since April 2026"
+    info "  JA3/JA4 fingerprint is unique and not matching any browser"
+    info "  Fix: migrate to telemt (TCP Splice)"
+    PROXY_FOUND=1
+fi
+
+[ $PROXY_FOUND -eq 0 ] && warn "No known proxy process found (telemt/xray/mtproxy)"
+echo ""
+
+# ============================================================
+# [5/9] TCP SPLICE VERIFICATION (telemt only)
+# ============================================================
+step 5 "TCP Splice verification — DPI scanner simulation"
+info "Connecting without secret — should receive real mask domain cert"
+echo ""
+
+MASK_DOMAIN=$(cat /etc/telemt/mask-domain 2>/dev/null || echo "www.bing.com")
+
+# Connect to external IP (not 127.0.0.1) so telemt handles it as external scanner.
+# Use shell timeout instead of -timeout flag (not supported in OpenSSL 3.x / Debian 13).
+TLS=$(echo -n | timeout 12 openssl s_client \
+    -connect "${SERVER_IP}:${TEST_PORT}" \
+    -servername "$MASK_DOMAIN" \
+    2>&1)
+
+CERT_CN=$(echo "$TLS"     | grep -oP "CN\s*=\s*\K[^\n,]+" | head -1)
+CERT_ISSUER=$(echo "$TLS" | grep "issuer" | head -1 | sed 's/^[[:space:]]*//')
+CERT_VERIFY=$(echo "$TLS" | grep "Verify return code" | head -1)
+
+# OpenSSL 1.x: "SSL certificate verify ok"
+# OpenSSL 3.x: "Verify return code: 0 (ok)"
+# Both mean certificate verified successfully.
+if echo "$TLS" | grep -qE "SSL certificate verify ok|Verify return code: 0 \(ok\)"; then
+    ok "Real TLS — certificate verified OK (TCP Splice working)"
+    [ -n "$CERT_CN" ]     && info "  CN (issuer): $CERT_CN"
+    [ -n "$CERT_ISSUER" ] && info "  ${CERT_ISSUER}" | cut -c1-70
+    [ -n "$CERT_VERIFY" ] && info "  $CERT_VERIFY"
+    ok "DPI scanner sees real $MASK_DOMAIN — JA3/JA4 = browser fingerprint"
+elif echo "$TLS" | grep -q "CONNECTED"; then
+    warn "TLS connected but verification inconclusive"
+    [ -n "$CERT_CN" ]     && info "  CN: $CERT_CN"
+    [ -n "$CERT_VERIFY" ] && info "  $CERT_VERIFY"
+    info "  Manual check: openssl s_client -connect ${SERVER_IP}:${TEST_PORT} -servername $MASK_DOMAIN"
+elif ! systemctl is-active --quiet telemt 2>/dev/null; then
+    warn "telemt not running — skipping TCP Splice check"
+else
+    warn "Could not verify — try manually:"
+    info "  openssl s_client -connect ${SERVER_IP}:${TEST_PORT} -servername $MASK_DOMAIN"
+fi
+echo ""
+
+# ============================================================
+# [6/9] ТСПУ DEGRADATION — LATENCY HOLD TEST
+# ============================================================
+step 6 "ТСПУ degradation — latency hold test (25 sec)"
+info "Holding TCP connection and measuring latency drift..."
+info "ТСПУ Stage 1: packet drops → TCP retransmit → latency rises"
+echo ""
+
+# Write to temp file — avoids pipe+heredoc conflict
+HOLD_SCRIPT="/tmp/hold_test_$$.py"
+cat > "$HOLD_SCRIPT" << 'PYEOF'
 import socket, time, sys
 
-targets = [
-    ('149.154.167.51', 443),
-    ('149.154.175.53', 443),
-    ('91.108.4.1',     443),
-]
+host = sys.argv[1]
+port = int(sys.argv[2])
 
-for host, port in targets:
+# Measure baseline latency (5 quick connects)
+baselines = []
+for _ in range(5):
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(5)
-        start = time.time()
+        s = socket.socket()
+        s.settimeout(3)
+        t = time.time()
         s.connect((host, port))
-        s.settimeout(25)
-        print(f"  Connected to {host}:{port} — holding 25 seconds...")
-        try:
-            data = s.recv(1)
-            elapsed = round(time.time() - start, 1)
-            print(f"  \033[33mGot data after {elapsed}s\033[0m")
-        except socket.timeout:
-            elapsed = round(time.time() - start, 1)
-            print(f"  \033[32mConnection held {elapsed}s without drop ✓ (no 19s cut)\033[0m")
-        except Exception as e:
-            elapsed = round(time.time() - start, 1)
-            if 14 <= elapsed <= 24:
-                print(f"  \033[31mDROPPED at {elapsed}s ✗ — TSPU 19-second signature detected!\033[0m")
-            else:
-                print(f"  \033[33mDropped at {elapsed}s (not typical TSPU pattern)\033[0m")
+        baselines.append(round((time.time()-t)*1000, 1))
         s.close()
-        break
-    except Exception as e:
-        print(f"  Cannot reach {host}:{port} — {e}")
-        continue
-EOF
+        time.sleep(0.2)
+    except:
+        pass
+
+if not baselines:
+    print("  \033[31m✗ Cannot connect to measure baseline\033[0m")
+    sys.exit(1)
+
+baseline = round(sum(baselines)/len(baselines), 1)
+print(f"  Baseline latency : {baseline}ms (avg of {len(baselines)} samples)")
+
+# Hold connection and sample latency every 5 seconds
+try:
+    s = socket.socket()
+    s.settimeout(5)
+    s.connect((host, port))
+    s.settimeout(30)
+
+    start = time.time()
+    drop_time = None
+    samples = []
+
+    print(f"  Holding connection for 25 sec...")
+
+    deadline = start + 25
+    last_sample = start
+
+    while time.time() < deadline:
+        time.sleep(1)
+        elapsed = round(time.time() - start, 1)
+        # Quick parallel connect to measure current latency
+        if time.time() - last_sample >= 5:
+            try:
+                t2 = socket.socket()
+                t2.settimeout(3)
+                ts = time.time()
+                t2.connect((host, port))
+                lat = round((time.time()-ts)*1000, 1)
+                t2.close()
+                samples.append((elapsed, lat))
+                drift = lat - baseline
+                flag = ""
+                if drift > 200:   flag = " ← HIGH drift (ТСПУ degradation?)"
+                elif drift > 80:  flag = " ← elevated"
+                print(f"    t+{elapsed:4.1f}s  latency={lat}ms  drift={drift:+.1f}ms{flag}")
+                last_sample = time.time()
+            except:
+                pass
+
+        # Check if held connection was dropped
+        try:
+            s.settimeout(0.01)
+            data = s.recv(1)
+            s.settimeout(30)
+            if not data:
+                drop_time = round(time.time() - start, 1)
+                break
+        except socket.timeout:
+            pass
+        except (ConnectionResetError, OSError):
+            drop_time = round(time.time() - start, 1)
+            break
+
+    s.close()
+    total = round(time.time() - start, 1)
+
+    print()
+    if drop_time is not None:
+        if 14 <= drop_time <= 24:
+            print(f"  \033[31m✗ DROPPED at {drop_time}s — ТСПУ 19-second DPI signature!\033[0m")
+            print(f"    Plain MTProto/protocol detected and cut off")
+        else:
+            print(f"  \033[33m⚠ Connection dropped at {drop_time}s (not typical ТСПУ pattern)\033[0m")
+    else:
+        print(f"  \033[32m✓ Connection held {total}s without forced drop\033[0m")
+
+    if samples:
+        lats = [l for _, l in samples]
+        max_drift = round(max(lats) - baseline, 1)
+        if max_drift > 200:
+            print(f"  \033[31m✗ Max latency drift: +{max_drift}ms — ТСПУ Stage 1 packet drop suspected\033[0m")
+        elif max_drift > 80:
+            print(f"  \033[33m⚠ Max latency drift: +{max_drift}ms — elevated, monitor\033[0m")
+        else:
+            print(f"  \033[32m✓ Max latency drift: +{max_drift}ms — stable\033[0m")
+
+except Exception as e:
+    print(f"  \033[31m✗ Test failed: {e}\033[0m")
+PYEOF
+
+python3 "$HOLD_SCRIPT" "127.0.0.1" "$TEST_PORT"
+rm -f "$HOLD_SCRIPT"
 echo ""
 
 # ============================================================
-# 6. DNS RESOLUTION CHECK
+# [7/9] DNS RESOLUTION
 # ============================================================
-echo -e "${BLUE}[6/9] DNS resolution check (tunnel DNS leak symptom)${NC}"
-echo " Testing resolution speed for popular domains..."
-
-for DOMAIN in youtube.com google.com cloudflare.com telegram.org; do
+step 7 "DNS resolution speed"
+for DOMAIN in google.com telegram.org cloudflare.com youtube.com; do
     START=$(date +%s%3N)
     RESULT=$(python3 -c "
 import socket
-try:
-    ip = socket.gethostbyname('$DOMAIN')
-    print(ip)
-except Exception as e:
-    print('FAILED: ' + str(e))
+try:    print(socket.gethostbyname('$DOMAIN'))
+except Exception as e: print('FAILED: ' + str(e))
 " 2>/dev/null)
     END=$(date +%s%3N)
     MS=$((END - START))
-
     if echo "$RESULT" | grep -q "FAILED"; then
-        echo -e "  ${RED}✗ $DOMAIN — FAILED ($RESULT)${NC}"
+        fail "$DOMAIN — FAILED"
     elif [ $MS -gt 2000 ]; then
-        echo -e "  ${YELLOW}⚠ $DOMAIN → $RESULT (${MS}ms — slow, may cause client DNS timeouts)${NC}"
+        warn "$DOMAIN → $RESULT (${MS}ms — slow, may cause timeouts)"
     else
-        echo -e "  ${GREEN}✓ $DOMAIN → $RESULT (${MS}ms)${NC}"
+        ok "$DOMAIN → $RESULT (${MS}ms)"
     fi
 done
 echo ""
 
 # ============================================================
-# 7. XRAY / PROXY CONFIG CHECK
+# [8/9] NETWORK QUALITY
 # ============================================================
-echo -e "${BLUE}[7/9] Xray/proxy config check (Vision flow symptom)${NC}"
+step 8 "Network quality (BBR, memory, interface errors)"
 
-if pgrep -x xray &>/dev/null || pgrep -f "xray run" &>/dev/null; then
-    echo -e "  ${GREEN}✓ xray is running${NC}"
-    XRAY_BIN=$(which xray 2>/dev/null || find /usr/local/bin /opt -name xray 2>/dev/null | head -1)
-    if [ -n "$XRAY_BIN" ]; then
-        VERSION=$($XRAY_BIN version 2>/dev/null | head -1)
-        echo "    Version: ${VERSION:-unknown}"
-    fi
-    CONF=$(find /usr/local/etc/xray /etc/xray /opt -name "*.json" 2>/dev/null | head -3)
-    for F in $CONF; do
-        grep -q "xtls-rprx-vision" "$F" 2>/dev/null && \
-            echo -e "  ${GREEN}✓ Vision flow (xtls-rprx-vision) found in $F${NC}"
-        grep -q '"flow": ""' "$F" 2>/dev/null || grep -q '"flow":""' "$F" 2>/dev/null && \
-            echo -e "  ${YELLOW}⚠ Empty flow in $F — Vision disabled${NC}"
-        grep -q "reality" "$F" 2>/dev/null && \
-            echo -e "  ${GREEN}✓ Reality settings found in $F${NC}"
-        grep -q '"security": "tls"' "$F" 2>/dev/null && \
-            echo -e "  ${YELLOW}⚠ TLS mode in $F — if Reality intended, check sec setting${NC}"
-    done
-elif pgrep -f "sing-box" &>/dev/null; then
-    echo -e "  ${RED}✗ sing-box is running instead of xray${NC}"
-    echo "    sing-box does NOT support xtls-rprx-vision (Vision flow)"
-    echo "    Client will see: vision: not a valid supported TLS connection"
-    echo "    Fix: switch server to xray"
-elif docker ps 2>/dev/null | grep -q mtproxy; then
-    echo -e "  ${GREEN}✓ MTProxy container is running${NC}"
-else
-    echo -e "  ${YELLOW}⚠ No known proxy process detected (xray / sing-box / mtproxy)${NC}"
-fi
-echo ""
+CONGESTION=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null)
 
-# ============================================================
-# 8. NETWORK QUALITY CHECK
-# ============================================================
-echo -e "${BLUE}[8/9] Network quality check (slow download symptom)${NC}"
+[ "$CONGESTION" = "bbr" ] \
+    && ok "BBR enabled (tcp_congestion_control=bbr)" \
+    || warn "BBR not enabled (current: ${CONGESTION:-unknown}) — recommend enabling"
 
-CONGESTION=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
-QDISC=$(sysctl net.core.default_qdisc 2>/dev/null | awk '{print $3}')
+[ "$QDISC" = "fq" ] \
+    && ok "Fair queue (fq) enabled" \
+    || warn "qdisc=${QDISC:-unknown} — recommend fq"
 
-if [ "$CONGESTION" = "bbr" ]; then
-    echo -e "  ${GREEN}✓ BBR enabled (congestion control = bbr)${NC}"
-else
-    echo -e "  ${YELLOW}⚠ BBR not enabled (current: ${CONGESTION:-unknown})${NC}"
-    echo "    Fix: echo 'net.ipv4.tcp_congestion_control=bbr' >> /etc/sysctl.conf && sysctl -p"
-fi
-
-if [ "$QDISC" = "fq" ]; then
-    echo -e "  ${GREEN}✓ Fair queue (fq) enabled${NC}"
-else
-    echo -e "  ${YELLOW}⚠ qdisc = ${QDISC:-unknown} (recommended: fq)${NC}"
+if [ "$CONGESTION" != "bbr" ] || [ "$QDISC" != "fq" ]; then
+    info "  Enable: echo -e 'net.ipv4.tcp_congestion_control=bbr\\nnet.core.default_qdisc=fq' >> /etc/sysctl.conf && sysctl -p"
 fi
 
 IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
 if [ -n "$IFACE" ]; then
-    RX_ERR=$(cat /sys/class/net/$IFACE/statistics/rx_errors 2>/dev/null)
-    TX_ERR=$(cat /sys/class/net/$IFACE/statistics/tx_errors 2>/dev/null)
-    RX_DROP=$(cat /sys/class/net/$IFACE/statistics/rx_dropped 2>/dev/null)
-    echo "  Interface: $IFACE"
-    echo "  RX errors: ${RX_ERR:-0}, TX errors: ${TX_ERR:-0}, RX dropped: ${RX_DROP:-0}"
-    if [ "${RX_ERR:-0}" -gt 1000 ] || [ "${RX_DROP:-0}" -gt 1000 ]; then
-        echo -e "  ${YELLOW}⚠ High error count — may affect download speed${NC}"
-    else
-        echo -e "  ${GREEN}✓ Interface errors within normal range${NC}"
-    fi
+    RX_ERR=$(cat /sys/class/net/$IFACE/statistics/rx_errors 2>/dev/null || echo 0)
+    TX_ERR=$(cat /sys/class/net/$IFACE/statistics/tx_errors 2>/dev/null || echo 0)
+    RX_DROP=$(cat /sys/class/net/$IFACE/statistics/rx_dropped 2>/dev/null || echo 0)
+    info "Interface $IFACE: RX err=${RX_ERR} TX err=${TX_ERR} RX drop=${RX_DROP}"
+    { [ "${RX_ERR:-0}" -gt 10000 ] || [ "${RX_DROP:-0}" -gt 50000 ]; } \
+        && warn "High error count — may affect throughput" \
+        || ok "Interface errors within normal range"
 fi
 
-MEM_FREE=$(free -m | awk '/^Mem:/{print $7}')
-SWAP_TOTAL=$(free -m | awk '/^Swap:/{print $2}')
-echo "  Free RAM : ${MEM_FREE:-?} MB"
-if [ "${MEM_FREE:-999}" -lt 100 ]; then
-    echo -e "  ${RED}✗ Low memory — may cause random connection drops${NC}"
-else
-    echo -e "  ${GREEN}✓ Memory OK${NC}"
-fi
-if [ "${SWAP_TOTAL:-0}" -eq 0 ]; then
-    echo -e "  ${YELLOW}⚠ No swap — add swap to prevent OOM drops${NC}"
-fi
+MEM_FREE=$(free -m 2>/dev/null | awk '/^Mem:/{print $7}')
+SWAP_TOTAL=$(free -m 2>/dev/null | awk '/^Swap:/{print $2}')
+info "Free RAM: ${MEM_FREE:-?} MB"
+[ "${MEM_FREE:-999}" -lt 100 ] \
+    && fail "Low memory (<100MB) — may cause random drops" \
+    || ok "Memory OK"
+[ "${SWAP_TOTAL:-1}" -eq 0 ] && warn "No swap — add swap to prevent OOM"
 echo ""
 
 # ============================================================
-# 9. KNOWN BLOCKED RANGES
+# [9/9] IP REPUTATION
 # ============================================================
-echo -e "${BLUE}[9/9] Known blocked/allowed IP ranges${NC}"
+step 9 "IP reputation check"
 if [ -n "$SERVER_IP" ]; then
-    python3 - "$SERVER_IP" << 'EOF'
-import ipaddress, sys
-
-ip_str = sys.argv[1]
+    GEO2=$(curl -s --max-time 6 \
+        "http://ip-api.com/json/${SERVER_IP}?fields=as,hosting,proxy,mobile" \
+        2>/dev/null)
+    if [ -n "$GEO2" ]; then
+        echo "$GEO2" | python3 -c "
+import sys, json
 try:
-    ip = ipaddress.ip_address(ip_str)
-except:
-    print(f"  Invalid IP: {ip_str}")
-    sys.exit()
+    d = json.load(sys.stdin)
+    hosting = d.get('hosting', False)
+    proxy   = d.get('proxy', False)
+    mobile  = d.get('mobile', False)
+    asn     = d.get('as', '?')
 
-blocked = [
-    ('70.34.0.0/15',     'Vultr Stockholm'),
-    ('78.141.192.0/18',  'Vultr Amsterdam'),
-    ('45.76.0.0/16',     'Vultr US/EU'),
-    ('149.28.0.0/16',    'Vultr US/EU'),
-    ('108.61.0.0/16',    'Vultr US/EU'),
-    ('207.246.0.0/16',   'Vultr US/EU'),
-    ('66.42.0.0/16',     'Vultr US/EU'),
-    ('104.238.128.0/17', 'Vultr US/EU'),
-    ('45.32.0.0/16',     'Vultr US/EU'),
-    ('136.244.64.0/18',  'Vultr Frankfurt'),
-    ('139.180.0.0/16',   'Vultr Singapore/Tokyo'),
-    ('167.179.0.0/16',   'Vultr'),
-    ('155.138.0.0/16',   'Vultr'),
-    ('64.176.0.0/16',    'Vultr'),
-]
+    # Known blocked AS prefixes (Vultr major ranges)
+    BLOCKED_AS = ['AS20473','AS64515']
+    SAFE_AS    = []
 
-accessible = [
-    ('185.185.68.0/22',  'Aeza EU - usually accessible'),
-    ('194.165.16.0/24',  'Aeza EU - usually accessible'),
-    ('45.87.212.0/22',   'MVPS.net - usually accessible'),
-]
+    asn_num = asn.split()[0] if asn else ''
+    if asn_num in BLOCKED_AS:
+        print(f'  \033[31m✗ AS {asn} is frequently blocked by Russian ISPs\033[0m')
+    else:
+        print(f'  \033[32m✓ AS {asn} — not in known blocklist\033[0m')
 
-found = False
-for cidr, desc in blocked:
-    try:
-        if ip in ipaddress.ip_network(cidr, strict=False):
-            print(f"  \033[31m✗ WARNING: {ip} → {cidr} ({desc})\033[0m")
-            print(f"  \033[31m  Often blocked by Russian ISPs (TSPU)\033[0m")
-            found = True
-    except: pass
+    if hosting:
+        print(f'  \033[33m⚠ Classified as hosting/datacenter IP\033[0m')
+        print(f'    ТСПУ may prioritize scanning this range')
+    else:
+        print(f'  \033[32m✓ Not classified as hosting (hosting=false)\033[0m')
+        print(f'    Lower chance of automated targeting by ТСПУ')
 
-for cidr, desc in accessible:
-    try:
-        if ip in ipaddress.ip_network(cidr, strict=False):
-            print(f"  \033[32m✓ OK: {ip} → {cidr}\033[0m")
-            print(f"  \033[32m  {desc}\033[0m")
-            found = True
-    except: pass
-
-if not found:
-    print(f"  {ip_str} not in any known range - check manually")
-EOF
+    if proxy:
+        print(f'  \033[33m⚠ IP marked as proxy/VPN in ip-api database\033[0m')
+except Exception as e:
+    print(f'  Parse error: {e}')
+" 2>/dev/null
+    else
+        warn "Could not reach ip-api.com"
+    fi
+    info ""
+    info "Manual checks:"
+    info "  AS info    : https://bgp.he.net/ip/${SERVER_IP}"
+    info "  Reputation : https://www.ipqualityscore.com/ip-reputation/${SERVER_IP}"
+    info "  Port test  : https://check-host.net/check-tcp#${SERVER_IP}:${TEST_PORT}"
 else
-    echo "  Skipped - no IP"
+    warn "Skipped — no server IP"
 fi
+echo ""
 
-echo ""
+# ============================================================
+# SUMMARY
+# ============================================================
 echo "============================================================"
-echo -e " ${CYAN}CLIENT SYMPTOMS → SERVER CHECKS MAPPING:${NC}"
-echo " wsarecv ~19s drops    → see check [5] above"
-echo " dns: exchange failed  → see check [6] above"
-echo " vision: not valid TLS → see check [7] above"
-echo " slow download         → see check [8] above"
+echo -e "${CYAN} Summary — symptom → check mapping${NC}"
+echo "============================================================"
+echo " ТСПУ blocks this port       → [2] port test from Russia"
+echo " Proxy not detected/running  → [4] proxy process"
+echo " TCP Splice not working      → [5] TLS cert from mask domain"
+echo " Latency rising (600ms+)     → [6] hold test drift"
+echo " 19-second connection drops  → [6] hold test drop_time"
+echo " DNS failures on client      → [7] DNS resolution"
+echo " Slow downloads              → [8] BBR / network quality"
+echo " IP range blocked            → [9] reputation"
 echo ""
-echo -e " ${CYAN}MANUAL CHECK:${NC}"
-echo " https://check-host.net/check-tcp#${SERVER_IP}:443"
-echo " https://check-host.net/check-tcp#${SERVER_IP}:8443"
+echo -e "${CYAN} ТСПУ two-stage blocking timeline:${NC}"
+echo " Stage 1 (5-15 min): DPI detects protocol"
+echo "   → protocols capacity 2-10% → packet drops → latency rises"
+echo " Stage 2: IP:port added to ЦСУ blocklist"
+echo "   → behavior: block → hard block"
+echo " With telemt TCP Splice: Stage 1 detection is much harder"
+echo " (DPI sees real TLS to mask domain, not MTProto fingerprint)"
 echo "============================================================"
 echo ""
