@@ -469,6 +469,7 @@ IP-based blocking (Eco Highway BGP) still applies if ЦСУ accumulates logs.
 
 import json, time, sys, socket, datetime, subprocess
 import urllib.request
+from datetime import timezone
 
 def read_cfg(f, default=''):
     try: return open(f).read().strip()
@@ -490,7 +491,7 @@ RU_NODES = [
 ]
 
 def ts():
-    return datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+    return datetime.datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
 def log(msg, level='INFO'):
     line = f"[{ts()}] [{level}] {msg}"
@@ -531,7 +532,7 @@ def check_local_port():
         s = socket.socket()
         s.settimeout(5)
         t = time.time()
-        s.connect((SERVER_IP, PORT))
+        s.connect(('127.0.0.1', PORT))  # 127.0.0.1 avoids UFW rate limit on external IP
         ms = round((time.time()-t)*1000, 1)
         s.close()
         return True, ms
@@ -551,7 +552,7 @@ def check_from_russia():
     url = f"https://check-host.net/check-tcp?host={SERVER_IP}:{PORT}"
     for n in RU_NODES: url += f"&node={n}"
     try:
-        req = urllib.request.Request(url, headers={'Accept': 'application/json'})
+        req = urllib.request.Request(url, headers={'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36'})
         with urllib.request.urlopen(req, timeout=10) as r:
             data = json.loads(r.read())
         req_id = data.get('request_id', '')
@@ -563,7 +564,7 @@ def check_from_russia():
     try:
         req2 = urllib.request.Request(
             f"https://check-host.net/check-result/{req_id}",
-            headers={'Accept': 'application/json'})
+            headers={'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36'})
         with urllib.request.urlopen(req2, timeout=10) as r:
             results = json.loads(r.read())
     except Exception as e:
