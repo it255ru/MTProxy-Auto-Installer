@@ -40,7 +40,7 @@
 | `server_harden.sh` | VPS | После проверки прокси, один раз |
 | `tspu_client_check.sh` | Клиент (Россия) | При проблемах с подключением |
 
-Подробная документация по каждому скрипту: **[README_INSTALL.md](README_INSTALL.md)**, **[README_CHECKERS.md](README_CHECKERS.md)**, **[README_HARDEN.md](README_HARDEN.md)**
+Подробная документация по каждому скрипту: **[README_INSTALL.md](README.md)**, **[TSPU_Readme.md](TSPU_Readme.md)**, **[HARDEN_Readme.md](HARDEN_Readme.md)**
 
 ---
 
