@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""
+proxy-stats — telemt MTProxy connection statistics.
+Shows active users and failure reasons.
+
+Usage:
+  proxy-stats            — run once
+  watch -n 10 proxy-stats — refresh every 10 sec
+"""
+
+import subprocess, json, urllib.request, collections, re, datetime
+from datetime import timezone
+
+def get_users():
+    try:
+        req = urllib.request.Request('http://127.0.0.1:9091/v1/users',
+                                     headers={'Accept': 'application/json'})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read()).get('data', [])
+    except Exception as e:
+        print(f"  API unavailable: {e}")
+        return []
+
+def get_journal(minutes=60):
+    result = subprocess.run(
+        ['journalctl', '-u', 'telemt',
+         f'--since={minutes} minutes ago',
+         '--no-pager', '-o', 'short-iso'],
+        capture_output=True, text=True)
+    return result.stdout.splitlines()
+
+def classify_error(raw):
+    """Classify raw error string into a human-readable category."""
+    r = raw.strip()
+    if 'Telegram handshake timeout' in r:
+        return 'Mobile operator blocking MTProto'
+    if 'hard idle timeout' in r:
+        return 'Idle timeout (normal — Telegram reconnects)'
+    if 'Connection timed out' in r:
+        return 'TCP timeout (no route or firewall)'
+    if 'Frame too large' in r:
+        return 'Garbage data (scanner / bot)'
+    if 'Invalid secret' in r or 'invalid secret' in r:
+        return 'Invalid secret'
+    if 'Connection reset' in r:
+        return 'Connection reset by client'
+    if 'TLS' in r or 'tls' in r:
+        return 'TLS error'
+    return r[:80]  # fallback — truncate to 80 chars
+
+def parse_errors(lines):
+    """Parse journal lines, return {category: {ip: count}}."""
+    errors = collections.defaultdict(lambda: collections.defaultdict(int))
+    for line in lines:
+        if 'Connection closed with error' not in line:
+            continue
+        m = re.search(r'peer=([0-9.]+):\d+.*error=(.+)', line)
+        if m:
+            ip     = m.group(1)
+            reason = classify_error(m.group(2))
+            errors[reason][ip] += 1
+    return errors
+
+def geo_lookup(ip):
+    """Quick geo lookup with in-memory cache."""
+    if not hasattr(geo_lookup, '_cache'):
+        geo_lookup._cache = {}
+    if ip in geo_lookup._cache:
+        return geo_lookup._cache[ip]
+    try:
+        req = urllib.request.Request(
+            f'http://ip-api.com/json/{ip}?fields=country,isp,as',
+            headers={'Accept': 'application/json'})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            d = json.loads(r.read())
+        result = f"{d.get('country','?')} / {d.get('isp','?')}"
+    except:
+        result = '?'
+    geo_lookup._cache[ip] = result
+    return result
+
+# ---- Main output ----
+now = datetime.datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+print(f"\n{'='*60}")
+print(f"  Proxy Stats  {now}")
+print(f"{'='*60}")
+
+# Active users
+users = get_users()
+print("\n  ACTIVE USERS:")
+if not users:
+    print("    no data")
+else:
+    for u in users:
+        conns  = u['current_connections']
+        ips    = u['active_unique_ips_list']
+        mb     = round(u['total_octets'] / 1048576, 1)
+        status = "\033[32m✓ online\033[0m" if conns > 0 else "— offline"
+        print(f"    {u['username']:12} {status}   conns={conns}  traffic={mb} MB")
+        for ip in ips:
+            geo = geo_lookup(ip)
+            print(f"                 {ip}  ({geo})")
+
+# Errors in the last hour
+print("\n  FAILED CONNECTIONS (last hour):")
+lines  = get_journal(60)
+errors = parse_errors(lines)
+
+# Separate meaningful errors from background noise
+NOISE = {'Idle timeout (normal — Telegram reconnects)'}
+important = {k: v for k, v in errors.items() if k not in NOISE}
+noise     = {k: v for k, v in errors.items() if k in NOISE}
+
+if not errors:
+    print("    No errors")
+else:
+    if important:
+        for reason, ip_counts in sorted(important.items(),
+                                        key=lambda x: -sum(x[1].values())):
+            total = sum(ip_counts.values())
+            print(f"\n    \033[33m{reason}\033[0m  (total: {total})")
+            for ip, cnt in sorted(ip_counts.items(), key=lambda x: -x[1])[:8]:
+                geo = geo_lookup(ip)
+                print(f"      {ip:18} {cnt:3}x   {geo}")
+
+    if noise:
+        total_noise = sum(sum(v.values()) for v in noise.values())
+        print(f"\n    Background noise: {total_noise} events")
+        for reason, ip_counts in noise.items():
+            print(f"      {reason}: {sum(ip_counts.values())}")
+
+print(f"\n{'='*60}\n")
