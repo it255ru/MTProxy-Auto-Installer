@@ -28,13 +28,14 @@ MAGENTA='\033[0;35m'
 NC='\033[0m'
 
 PORT="${1:-443}"
-MASK_DOMAIN="${2:-www.bing.com}"
+MASK_DOMAIN="${2:-browser.yandex.com}"
 NOTIFY_EMAIL="${3:-${MTPROXY_EMAIL:-}}"
 
 LATENCY_WARN_MS=150
 LATENCY_CRIT_MS=400
 
 GOOD_MASK_DOMAINS=(
+    "browser.yandex.com"
     "www.bing.com"
     "www.microsoft.com"
     "www.apple.com"
