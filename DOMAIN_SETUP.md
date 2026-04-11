@@ -16,7 +16,7 @@
 
 ## Требования
 
-- Любой домен (например `hardeninglab.com`, `myproxy.net`)
+- Любой домен (например `glab.com`, `myproxy.net`)
 - Доступ к панели управления DNS у регистратора
 - VPS уже настроен с работающим `mtproxy_install.sh`
 
