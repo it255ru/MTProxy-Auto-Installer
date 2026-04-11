@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""
+MTProxy Monitor (telemt) — detects ТСПУ degradation before full block.
+
+ТСПУ two-stage blocking:
+  Stage 1: DPI detects protocol → logs → ЦСУ analysis
+           protocols capacity (2-10%) drops packets → TCP retransmits → LATENCY RISES
+  Stage 2: IP:port added to cleaned blocklist → hard block (behavior: block)
+  Window: 5-15 minutes between stages.
+
+With telemt TCP Splice, DPI sees real TLS → Stage 1 detection is harder.
+IP-based blocking (Eco Highway BGP) still applies if ЦСУ accumulates logs.
+"""
+
+import json, time, sys, socket, datetime, subprocess
+import urllib.request
+
+def read_cfg(f, default=''):
+    try: return open(f).read().strip()
+    except: return default
+
+SERVER_IP        = read_cfg('/etc/telemt/server-ip')
+PORT             = int(read_cfg('/etc/telemt/port', '443'))
+LOG_FILE         = '/var/log/mtproxy-monitor.log'
+STATUS_FILE      = '/var/run/mtproxy-monitor.status'
+NOTIFY_EMAIL     = read_cfg('/etc/telemt/notify-email')
+LATENCY_WARN_MS  = int(read_cfg('/etc/telemt/latency-warn', '150'))
+LATENCY_CRIT_MS  = int(read_cfg('/etc/telemt/latency-crit', '400'))
+
+RU_NODES = [
+    'ru1.node.check-host.net',
+    'ru2.node.check-host.net',
+    'ru3.node.check-host.net',
+    'msk.node.check-host.net',
+]
+
+def ts():
+    return datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+
+def log(msg, level='INFO'):
+    line = f"[{ts()}] [{level}] {msg}"
+    print(line)
+    try:
+        with open(LOG_FILE, 'a') as f: f.write(line + '\n')
+    except: pass
+
+def get_last_status():
+    try: return open(STATUS_FILE).read().strip()
+    except: return 'UNKNOWN'
+
+def save_status(s):
+    try:
+        with open(STATUS_FILE, 'w') as f: f.write(s)
+    except: pass
+
+def send_alert(subject, body):
+    if not NOTIFY_EMAIL: return
+    try:
+        subprocess.run(['mail', '-s', subject, NOTIFY_EMAIL],
+                       input=body, text=True, timeout=15)
+        log(f"Alert sent: {subject}")
+    except Exception as e:
+        log(f"Alert failed: {e}", 'WARN')
+
+def check_service():
+    try:
+        r = subprocess.run(['systemctl', 'is-active', 'telemt'],
+                           capture_output=True, text=True, timeout=5)
+        st = r.stdout.strip()
+        return st == 'active', st
+    except:
+        return False, 'error'
+
+def check_local_port():
+    try:
+        s = socket.socket()
+        s.settimeout(5)
+        t = time.time()
+        s.connect(("127.0.0.1", PORT))
+        ms = round((time.time()-t)*1000, 1)
+        s.close()
+        return True, ms
+    except Exception as e:
+        return False, str(e)
+
+def check_api():
+    try:
+        req = urllib.request.Request('http://127.0.0.1:9091/v1/users',
+                                     headers={'Accept': 'application/json'})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return True, json.loads(r.read())
+    except:
+        return False, None
+
+def check_from_russia():
+    url = f"https://check-host.net/check-tcp?host={SERVER_IP}:{PORT}"
+    for n in RU_NODES: url += f"&node={n}"
+    try:
+        req = urllib.request.Request(url, headers={'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        req_id = data.get('request_id', '')
+    except Exception as e:
+        log(f"check-host.net request failed: {e}", 'WARN')
+        return []
+    if not req_id: return []
+    time.sleep(12)
+    try:
+        req2 = urllib.request.Request(
+            f"https://check-host.net/check-result/{req_id}",
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36', 'Accept': 'application/json'})
+        with urllib.request.urlopen(req2, timeout=10) as r:
+            results = json.loads(r.read())
+    except Exception as e:
+        log(f"check-host.net result failed: {e}", 'WARN')
+        return []
+    out = []
+    for node, val in results.items():
+        short = node.replace('.node.check-host.net', '')
+        if val is None:
+            out.append((short, None, 'pending'))
+        elif isinstance(val, list) and val:
+            v = val[0]
+            if isinstance(v, dict) and 'time' in v:
+                out.append((short, True, round(v['time']*1000, 1)))
+            elif isinstance(v, list) and v[0] == 'OK':
+                ms = round(v[1]*1000, 1) if len(v) > 1 else 0
+                out.append((short, True, ms))
+            else:
+                err = v[0] if isinstance(v, list) else str(v)
+                out.append((short, False, err))
+        else:
+            out.append((short, False, 'no response'))
+    return out
+
+# ---- Main ----
+log("=== Monitor check started ===")
+last = get_last_status()
+
+# 1. Service
+svc_ok, svc_st = check_service()
+if not svc_ok:
+    log(f"SERVICE DOWN: {svc_st}", 'CRIT')
+    if last != 'CRIT':
+        send_alert("[MTProxy] CRITICAL: telemt service not running",
+                   f"Server: {SERVER_IP}:{PORT}\nStatus: {svc_st}\n\n"
+                   f"Fix: systemctl restart telemt\n"
+                   f"Logs: journalctl -u telemt -n 50")
+    save_status('CRIT'); sys.exit(2)
+log(f"Service: {svc_st}")
+
+# 2. API
+api_ok, _ = check_api()
+log(f"API: {'ok' if api_ok else 'not responding (may be starting)'}")
+
+# 3. Local port
+local_ok, local_ms = check_local_port()
+if not local_ok:
+    log(f"LOCAL PORT FAILED: {local_ms}", 'CRIT')
+    if last != 'CRIT':
+        send_alert("[MTProxy] CRITICAL: Port not responding",
+                   f"Port {PORT} on {SERVER_IP}: {local_ms}\n\nFix: systemctl restart telemt")
+    save_status('CRIT'); sys.exit(2)
+log(f"Local TCP: {local_ms}ms")
+
+# 4. Latency from Russia
+log("Checking from Russian nodes (~15 sec)...")
+ru = check_from_russia()
+ok_nodes   = [(n, ms) for n, s, ms in ru if s is True]
+fail_nodes = [(n, ms) for n, s, ms in ru if s is False]
+crit_lat   = [(n, ms) for n, ms in ok_nodes if isinstance(ms, float) and ms > LATENCY_CRIT_MS]
+warn_lat   = [(n, ms) for n, ms in ok_nodes if isinstance(ms, float) and ms > LATENCY_WARN_MS]
+
+for node, status, ms in ru:
+    if status is True:
+        flag = (' ← HIGH (ТСПУ degradation?)' if isinstance(ms, float) and ms > LATENCY_CRIT_MS
+                else ' ← elevated' if isinstance(ms, float) and ms > LATENCY_WARN_MS else '')
+        log(f"  {node}: {ms}ms{flag}")
+    elif status is False:
+        log(f"  {node}: BLOCKED ({ms})", 'WARN')
+    else:
+        log(f"  {node}: {ms}")
+
+# ---- Determine status ----
+if fail_nodes and len(fail_nodes) == len(ru) and ru:
+    status = 'CRIT'
+    log("STATUS: CRITICAL — fully blocked from Russia", 'CRIT')
+    if last != 'CRIT':
+        send_alert(
+            "[MTProxy] CRITICAL: Fully blocked from Russia",
+            f"MTProxy {SERVER_IP}:{PORT} unreachable from all Russian nodes.\n\n"
+            f"IP:port is in ТСПУ blocklist (Stage 2 complete).\n\n"
+            f"Results:\n" + "\n".join(f"  {n}: {m}" for n,m in fail_nodes) +
+            f"\n\nActions:\n"
+            f"  1. Change VPS IP — most effective\n"
+            f"  2. Change mask domain: bash /root/mtproxy_install.sh {PORT} www.apple.com\n"
+            f"  3. Change port: bash /root/mtproxy_install.sh 8443\n\n"
+            f"Service is still running — only external IP:port is blocked.")
+
+elif crit_lat:
+    status = 'WARN'
+    avg_ms = round(sum(ms for _,ms in crit_lat)/len(crit_lat), 1)
+    log(f"STATUS: WARNING — latency {avg_ms}ms (ТСПУ Stage 1 degradation)", 'WARN')
+    if last not in ('WARN', 'CRIT'):
+        send_alert(
+            f"[MTProxy] WARNING: Latency {avg_ms}ms — ТСПУ degradation signal",
+            f"MTProxy {SERVER_IP}:{PORT} — HIGH LATENCY from Russia.\n"
+            f"Average: {avg_ms}ms (threshold: {LATENCY_CRIT_MS}ms)\n\n"
+            f"Nodes:\n" + "\n".join(f"  {n}: {ms}ms" for n,ms in crit_lat) +
+            f"\n\nWith telemt TCP Splice this is unusual. Possible causes:\n"
+            f"  a) General VPS routing degradation\n"
+            f"  b) ТСПУ Stage 1 beginning\n\n"
+            f"Full block may follow in 5-15 min. Monitor next check.")
+
+elif fail_nodes and ok_nodes:
+    status = 'WARN'
+    log("STATUS: WARNING — partial block (ISP-level)", 'WARN')
+    if last not in ('WARN', 'CRIT'):
+        send_alert("[MTProxy] WARNING: Partial block from Russia",
+                   f"Reachable: {', '.join(n for n,_ in ok_nodes)}\n"
+                   f"Blocked:   {', '.join(n for n,_ in fail_nodes)}\n\n"
+                   f"May be ISP-level block or routing issue.")
+
+elif warn_lat:
+    avg_ms = round(sum(ms for _,ms in warn_lat)/len(warn_lat), 1)
+    status = 'WARN_LATENCY'
+    log(f"STATUS: ELEVATED LATENCY — avg {avg_ms}ms (watching, no alert)")
+
+else:
+    status = 'OK'
+    avg_ms = round(sum(ms for _,ms in ok_nodes)/len(ok_nodes), 1) if ok_nodes else 0
+    log(f"STATUS: OK — avg latency from Russia: {avg_ms}ms")
+    if last in ('WARN', 'CRIT'):
+        send_alert("[MTProxy] RECOVERED: Proxy accessible from Russia",
+                   f"MTProxy {SERVER_IP}:{PORT} is reachable again.\nPrevious: {last}")
+
+save_status(status)
+log("=== Check complete ===\n")
+sys.exit(0 if status in ('OK', 'WARN_LATENCY') else (1 if status == 'WARN' else 2))
