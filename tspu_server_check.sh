@@ -19,6 +19,7 @@ MAGENTA='\033[0;35m'
 NC='\033[0m'
 
 TEST_PORT="${1:-443}"
+CUSTOM_DOMAIN="${2:-}"   # optional: pass your domain e.g. hardeninglab.com
 UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
 
 # ============================================================
@@ -61,6 +62,7 @@ echo " TSPU Server Checker v5"
 echo "============================================================"
 echo " Server IP : ${SERVER_IP:-UNKNOWN}"
 echo " Test port : $TEST_PORT"
+[ -n "$CUSTOM_DOMAIN" ] && echo " Domain    : $CUSTOM_DOMAIN"
 echo " Date      : $(date '+%Y-%m-%d %H:%M:%S UTC')"
 echo "============================================================"
 echo ""
@@ -237,8 +239,19 @@ PROXY_FOUND=0
 if systemctl is-active --quiet telemt 2>/dev/null; then
     TELEMT_VER=$(telemt --version 2>/dev/null | head -1 || echo "unknown")
     ok "telemt is running ($TELEMT_VER)"
-    DOMAIN=$(cat /etc/telemt/mask-domain 2>/dev/null || \
-             grep -oP 'domain\s*=\s*"\K[^"]+' /etc/telemt/telemt.toml 2>/dev/null | head -1)
+    # Read domain from toml first (most accurate), fallback to mask-domain file
+    DOMAIN=""
+    [ -n "$CUSTOM_DOMAIN" ] && DOMAIN="$CUSTOM_DOMAIN"
+    if [ -z "$DOMAIN" ]; then
+        DOMAIN=$(grep -oP 'tls_domain\s*=\s*"\K[^"]+' /etc/telemt/telemt.toml 2>/dev/null | head -1)
+    fi
+    if [ -z "$DOMAIN" ]; then
+        DOMAIN=$(grep -oP 'domain\s*=\s*"\K[^"]+' /etc/telemt/telemt.toml 2>/dev/null | head -1)
+    fi
+    if [ -z "$DOMAIN" ]; then
+        DOMAIN=$(cat /etc/telemt/mask-domain 2>/dev/null)
+    fi
+    DOMAIN="${DOMAIN:-browser.yandex.com}"
     [ -n "$DOMAIN" ] && info "Mask domain: $DOMAIN"
     info "Mode: TCP Splice (DPI-proof — real cert from mask domain)"
     PROXY_FOUND=1
@@ -286,7 +299,19 @@ step 5 "TCP Splice verification — DPI scanner simulation"
 info "Connecting without secret — should receive real mask domain cert"
 echo ""
 
-MASK_DOMAIN=$(cat /etc/telemt/mask-domain 2>/dev/null || echo "www.bing.com")
+# Priority: CLI argument > telemt.toml > mask-domain file > fallback
+if [ -n "$CUSTOM_DOMAIN" ]; then
+    MASK_DOMAIN="$CUSTOM_DOMAIN"
+else
+    MASK_DOMAIN=$(grep -oP 'tls_domain\s*=\s*"\K[^"]+' /etc/telemt/telemt.toml 2>/dev/null | head -1)
+    if [ -z "$MASK_DOMAIN" ]; then
+        MASK_DOMAIN=$(grep -oP 'domain\s*=\s*"\K[^"]+' /etc/telemt/telemt.toml 2>/dev/null | head -1)
+    fi
+    if [ -z "$MASK_DOMAIN" ]; then
+        MASK_DOMAIN=$(cat /etc/telemt/mask-domain 2>/dev/null)
+    fi
+    MASK_DOMAIN="${MASK_DOMAIN:-browser.yandex.com}"
+fi
 
 # Connect to external IP (not 127.0.0.1) so telemt handles it as external scanner.
 # Use shell timeout instead of -timeout flag (not supported in OpenSSL 3.x / Debian 13).
@@ -561,6 +586,10 @@ echo ""
 # SUMMARY
 # ============================================================
 echo "============================================================"
+echo -e "${CYAN} Usage:${NC}"
+echo " bash tspu_server_check.sh [port] [domain]"
+echo " bash tspu_server_check.sh 443 hardeninglab.com"
+echo ""
 echo -e "${CYAN} Summary — symptom → check mapping${NC}"
 echo "============================================================"
 echo " ТСПУ blocks this port       → [2] port test from Russia"
