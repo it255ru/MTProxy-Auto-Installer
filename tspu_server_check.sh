@@ -4,8 +4,10 @@
 # Checks if this VPS is reachable from Russia and diagnoses
 # ТСПУ blocking status (DPI detection, latency degradation).
 #
-# Run on any VPS: bash tspu_server_check.sh [port]
-#   port — port to test (default: 443)
+# Run on any VPS: bash tspu_server_check.sh [port] [domain]
+#   port   — port to test (default: 443)
+#   domain — your custom mask domain (optional, e.g. hardeninglab.com)
+#            overrides domain from telemt.toml
 #
 # Supports: Ubuntu 20/22/24, Debian 11/12/13
 # ============================================================
@@ -252,6 +254,8 @@ if systemctl is-active --quiet telemt 2>/dev/null; then
         DOMAIN=$(cat /etc/telemt/mask-domain 2>/dev/null)
     fi
     DOMAIN="${DOMAIN:-browser.yandex.com}"
+    # Sync mask-domain file with actual domain from toml
+    echo "$DOMAIN" > /etc/telemt/mask-domain 2>/dev/null || true
     [ -n "$DOMAIN" ] && info "Mask domain: $DOMAIN"
     info "Mode: TCP Splice (DPI-proof — real cert from mask domain)"
     PROXY_FOUND=1
@@ -341,8 +345,11 @@ elif echo "$TLS" | grep -q "CONNECTED"; then
 elif ! systemctl is-active --quiet telemt 2>/dev/null; then
     warn "telemt not running — skipping TCP Splice check"
 else
-    warn "Could not verify — try manually:"
-    info "  openssl s_client -connect ${SERVER_IP}:${TEST_PORT} -servername $MASK_DOMAIN"
+    warn "Could not verify from server — self-connection bypasses telemt"
+    info "  ✓ Verify from a client machine instead:"
+    info "    openssl s_client -connect ${SERVER_IP}:${TEST_PORT} -servername $MASK_DOMAIN"
+    info "  Expected: CN=$MASK_DOMAIN, issuer=Let's Encrypt"
+    info "  If browser opens https://$MASK_DOMAIN — TCP Splice is working"
 fi
 echo ""
 
@@ -515,7 +522,7 @@ if [ -n "$IFACE" ]; then
     TX_ERR=$(cat /sys/class/net/$IFACE/statistics/tx_errors 2>/dev/null || echo 0)
     RX_DROP=$(cat /sys/class/net/$IFACE/statistics/rx_dropped 2>/dev/null || echo 0)
     info "Interface $IFACE: RX err=${RX_ERR} TX err=${TX_ERR} RX drop=${RX_DROP}"
-    { [ "${RX_ERR:-0}" -gt 10000 ] || [ "${RX_DROP:-0}" -gt 50000 ]; } \
+    { [ "${RX_ERR:-0}" -gt 10000 ] || [ "${RX_DROP:-0}" -gt 500000 ]; } \
         && warn "High error count — may affect throughput" \
         || ok "Interface errors within normal range"
 fi
