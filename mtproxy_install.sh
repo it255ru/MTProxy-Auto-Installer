@@ -415,15 +415,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$TELEMT_BIN --config $TELEMT_CONFIG
+ExecStart=$TELEMT_BIN $TELEMT_CONFIG
 Restart=always
 RestartSec=5
 LimitNOFILE=65536
 
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ReadWritePaths=$TELEMT_CONFIG_DIR /var/log /var/run
+ReadWritePaths=$TELEMT_CONFIG_DIR /var/log /var/run /var/lib/telemt
 
 [Install]
 WantedBy=multi-user.target
@@ -432,7 +429,9 @@ SERVICE
 systemctl daemon-reload
 systemctl enable telemt 2>/dev/null
 systemctl restart telemt
-sleep 10
+# Wait for ME pool initialization (telemt needs ~90 seconds)
+echo "  Waiting for telemt ME pool initialization (~90 sec)..."
+sleep 90
 
 if systemctl is-active --quiet telemt; then
     echo -e "  ${GREEN}✓ telemt service running${NC}"
@@ -742,6 +741,7 @@ systemctl status telemt --no-pager -l 2>/dev/null \
 echo ""
 
 echo "  [9b] Port $PORT listening:"
+# Port opens after ME pool init completes
 ss -tlnp | grep ":${PORT} " \
     && echo -e "    ${GREEN}✓ Listening${NC}" \
     || echo -e "    ${YELLOW}⚠ Not visible yet — check: journalctl -u telemt -n 20${NC}"
@@ -779,13 +779,13 @@ fi
 echo ""
 
 echo "  [9d] TCP Splice verification — scanner should get real $MASK_DOMAIN cert:"
-TLS=$(echo -n | openssl s_client \
+TLS=$(echo -n | timeout 12 openssl s_client \
     -connect "${SERVER_IP}:${PORT}" \
     -servername "$MASK_DOMAIN" \
-    -timeout 8 2>&1)
+    2>&1)
 CERT_CN=$(echo "$TLS" | grep -oP "CN\s*=\s*\K[^\n,]+" | head -1)
 CERT_ISSUER=$(echo "$TLS" | grep "issuer" | head -1 | sed 's/^[[:space:]]*//')
-if echo "$TLS" | grep -q "SSL certificate verify ok"; then
+if echo "$TLS" | grep -qE "SSL certificate verify ok|Verify return code: 0 .ok."; then
     echo -e "    ${GREEN}✓ Real TLS — certificate verified OK${NC}"
     [ -n "$CERT_CN" ]     && echo "    CN    : $CERT_CN"
     [ -n "$CERT_ISSUER" ] && echo "    ${CERT_ISSUER}" | cut -c1-72
