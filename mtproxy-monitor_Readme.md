@@ -4,6 +4,21 @@
 
 Запускается cron каждые 15 минут, проверяет задержку с российских узлов и отправляет email-алерт при аномалиях.
 
+```bash
+# mtproxy-monitor
+[2026-04-11 13:09:10] [INFO] === Monitor check started ===
+[2026-04-11 13:09:10] [INFO] Service: active
+[2026-04-11 13:09:10] [INFO] API: ok
+[2026-04-11 13:09:10] [INFO] Local TCP: 0.2ms
+[2026-04-11 13:09:10] [INFO] Checking from Russian nodes (~15 sec)...
+[2026-04-11 13:09:23] [INFO]   ru1: 121.7ms
+[2026-04-11 13:09:23] [INFO]   ru2: 111.7ms
+[2026-04-11 13:09:23] [INFO]   ru3: 109.6ms
+[2026-04-11 13:09:23] [INFO] STATUS: OK — avg latency from Russia: 114.3ms
+[2026-04-11 13:09:23] [INFO] === Check complete ===
+```
+
+
 ---
 
 ## Как работает
